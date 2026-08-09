@@ -1,0 +1,528 @@
+=begin pod
+
+=head1 MCP::Server::Tool::Shell
+
+A command runner for L<MCP::Server|https://github.com/m-doughty/MCP-Server>.
+
+Six tools — C<run>, C<start>, C<poll>, C<output>, C<kill> and C<allowed> — let
+an LLM invoke local programs. Which programs is your decision: either an exact
+allow list, or C<allow-any> for deployments that ask a human instead. Arguments
+are handed to the program as an argv vector (there is no shell anywhere in the
+code path), output is captured into capped buffers so a runaway command cannot
+exhaust the server's memory, foreground runs are bounded by a timeout, and work
+that will not fit in one tool call can be started as a background job and polled.
+
+=head2 Synopsis
+
+Plug it into a server you are already building:
+
+=begin code :lang<raku>
+use MCP::Server;
+use MCP::Server::Tool::Shell;
+
+my $server = MCP::Server.new(:name<dev-tools>, :version<1.0>);
+
+$server.plug: MCP::Server::Tool::Shell.new(
+    allow   => <git rg /usr/bin/jq>,   # exact argv0 strings
+    cwd     => '/home/me/project',     # optional default working directory
+    timeout => 15,                     # seconds, default 30
+);
+
+$server.run;   # registers sh_run, sh_start, sh_poll, sh_output, sh_kill, sh_allowed
+=end code
+
+Or assemble a server out of toolkit packs in one shot, with no glue code:
+
+=begin code :lang<raku>
+use MCP::Server;
+
+MCP::Server.new(
+    :name<dev-tools>,
+    :tools[
+        'Shell' => { allow => <git rg>, cwd => '/srv/app', prefix => 'git' },
+    ],
+).run;   # registers git_run, git_start, ...
+=end code
+
+Or run it straight off the C<raku-mcp> command line that ships with
+C<MCP::Server>:
+
+=begin code :lang<bash>
+raku-mcp --tool=Shell='{"allow":["git","rg"],"timeout":10}'
+=end code
+
+=begin code :lang<bash>
+raku-mcp --config=mcp.json
+=end code
+
+=begin code :lang<json>
+{
+  "name": "dev-tools",
+  "instructions": "Read-only git and ripgrep access to the checkout.",
+  "tools": {
+    "Shell#git": { "allow": ["git"], "cwd": "/srv/app", "prefix": "git" },
+    "Shell#search": { "allow": ["rg"], "cwd": "/srv/app", "prefix": "rg", "timeout": 10 }
+  }
+}
+=end code
+
+The C<#alias> suffix lets the same pack be loaded twice with different settings —
+here one instance can only run C<git> and the other only C<rg>, each under its
+own prefix.
+
+Wiring that into Claude Code:
+
+=begin code :lang<json>
+{
+  "mcpServers": {
+    "dev-tools": {
+      "command": "raku-mcp",
+      "args": ["--config=/home/me/mcp.json"]
+    }
+  }
+}
+=end code
+
+=head2 Configuration
+
+=begin table
+Key               | Type            | Default  | Meaning
+==================|=================|==========|=========================================
+allow             | Array of Str    | required | Exact argv0 strings that may be executed
+allow-any         | Bool            | False    | Run anything, with no allow list at all
+cwd               | Str (directory) | none     | Default working directory for every run
+timeout           | Real (seconds)  | 30       | Wall-clock budget for a foreground run
+max-output-bytes  | Int (bytes)     | 131072   | Retained output per stream, per run
+max-output-lines  | Int (lines)     | 2000     | Retained lines per stream, per run
+max-jobs          | Int             | 4        | Background jobs that may run at once
+max-finished-jobs | Int             | 16       | Finished jobs that stay pollable
+job-ttl           | Real (seconds)  | 600      | How long a finished job stays pollable
+=end table
+
+=item B<allow> must contain at least one non-empty string unless B<allow-any> is
+set. Entries are matched with C<eq> — see L<#Security>.
+
+=item B<allow-any> and B<allow> are mutually exclusive, and one of them is
+required: a runner that can run everything and a runner that can run nothing are
+both configurations somebody meant, but "I forgot to say" is not. See
+L<#Running anything: allow-any and MCP::Client::Policy>.
+
+=item B<cwd> must be an existing directory at construction time; the constructor
+dies otherwise. A per-call C<cwd> argument overrides it.
+
+=item B<timeout> must be greater than zero. Fractional values are fine
+(C<0.5> is half a second). A per-call C<timeout> argument overrides it for one
+C<run>; C<start> takes one too, but has no default.
+
+=item B<max-output-bytes> (floor 1024) and B<max-output-lines> (floor 10) apply
+per stream, so a run may hold twice them at most. See L<#Truncation>.
+
+=item B<max-jobs>, B<max-finished-jobs> (both at least 1) and B<job-ttl>
+(greater than zero) govern background jobs. See L<#Background jobs>.
+
+=item B<prefix> is I<not> a setting of this pack: it is reserved by the toolkit
+system. Pass it to C<.plug($kit, :prefix<git>)>, or beside the entry in
+C<:tools[...]> / the JSON config, to namespace the tool names.
+
+Every setting is validated when the toolkit is constructed, so a typo or a
+missing directory fails at startup rather than on the first tool call:
+
+=begin code :lang<raku>
+MCP::Server::Tool::Shell.new(allow => []);
+# Shell toolkit requires a non-empty allow list (or allow-any => True when
+# consent is enforced elsewhere, e.g. by an MCP::Client::Policy)
+
+MCP::Server::Tool::Shell.new(allow => <git>, allow-any => True);
+# Shell toolkit allow and allow-any are mutually exclusive: ...
+
+MCP::Server::Tool::Shell.new(allow => <git>, cwd => '/nope');
+# Shell toolkit cwd is not an existing directory: /nope
+
+MCP::Server::Tool::Shell.from-config({ allow => <git>, timeut => 5 });
+# Unknown config key(s) for MCP::Server::Tool::Shell: timeut.
+# Valid keys: allow, allow-any, cwd, job-ttl, max-finished-jobs, max-jobs,
+# max-output-bytes, max-output-lines, timeout
+=end code
+
+The default prefix is C<sh>, so the tools below are registered as C<sh_run>,
+C<sh_start>, C<sh_poll>, C<sh_output>, C<sh_kill> and C<sh_allowed> unless you
+pass a C<prefix> of your own.
+
+=head2 Tools
+
+=head3 run
+
+Runs one command in the foreground and waits for it.
+
+=begin table
+Argument | Type            | Required | Meaning
+=========|=================|==========|===========================================
+command  | string          | yes      | Must be `eq` an entry of the allow list
+args     | array of string | no       | One array entry per argument
+cwd      | string          | no       | Working directory, overriding the default
+stdin    | string          | no       | Text to write to standard input, then close
+timeout  | number          | no       | Seconds, overriding the server default
+=end table
+
+The result is a JSON object as text content:
+
+=begin code :lang<json>
+{"exit":0,"stderr":"","stdout":"main\n","timed-out":false}
+=end code
+
+=begin table
+Field      | Type    | Meaning
+===========|=========|=====================================================
+exit       | Int     | Process exit status; see below
+stdout     | Str     | What the command wrote to standard output, capped
+stderr     | Str     | What the command wrote to standard error, capped
+timed-out  | Bool    | True when the command was killed for exceeding the budget
+truncated  | Object  | Only present when output was dropped; see L<#Truncation>
+=end table
+
+C<exit> reports:
+
+=item the command's own exit status for a normal exit (C<0> on success);
+=item C<128 + signal> when the command was terminated by a signal, following
+the POSIX shell convention — a timeout kill on Unix therefore shows up as
+C<137> (128 + C<SIGKILL>), while on Windows C<TerminateProcess> yields C<1>;
+=item C<-1> when the command could not be spawned at all (not on C<PATH>, not
+executable, and so on). The reason is appended to C<stderr>;
+=item C<null> in the one case where there is no honest answer: the command was
+killed but its status never arrived (a grandchild is still holding the pipes,
+say), so the run is reported with C<timed-out: true> and an unknown status.
+
+A missing binary is a runtime condition, not a caller mistake, so it is reported
+in the payload:
+
+=begin code :lang<json>
+{"exit":-1,"stderr":"Failed to spawn process nosuchtool: no such file or directory (error code -2)","stdout":"","timed-out":false}
+=end code
+
+Anything the caller got wrong — a command that is not allowlisted, an C<args>
+value that is not an array of strings, a C<cwd> that does not exist, a
+C<timeout> that is not a positive number — is thrown instead, which
+C<MCP::Server> turns into an C<isError> tool result:
+
+=begin code
+Command 'rm' is not allowlisted. Allowed: git, rg
+=end code
+
+Examples of the call shape (arguments as an MCP client would send them):
+
+=begin code :lang<json>
+{ "command": "git", "args": ["rev-parse", "--abbrev-ref", "HEAD"] }
+{ "command": "rg", "args": ["--json", "TODO|FIXME", "lib"], "cwd": "/srv/app" }
+{ "command": "git", "args": ["log", "--grep", "fix the thing"] }
+{ "command": "jq", "args": ["-r", ".name"], "stdin": "{\"name\":\"widget\"}" }
+=end code
+
+That third one is the point of an argv vector: C<fix the thing> is a single
+argument, quoted by nobody, split by nobody.
+
+=head3 Standard input
+
+C<stdin> is written to the command and the pipe is then closed, so a filter
+sees a normal end of input. Three states, and they are all different:
+
+=item B<omitted> — standard input is left unconnected, exactly as it was before
+this feature existed. Nothing is written to the command and it is not handed an
+end of file we invented for it.
+=item B<empty string> — the pipe is opened and closed immediately, so the
+command reads an immediate EOF. This is what you want for a filter you have
+nothing to say to.
+=item B<a string> — written and then closed.
+
+The write is detached from the run: a command that never reads its input cannot
+stall the server, however much you send it, and a command that exits before
+reading everything just makes the write fail (C<EPIPE>), which is a runtime
+condition rather than an error. NUL bytes are fine here, unlike in C<args>: this
+is a byte stream, not a C string.
+
+=head3 Truncation
+
+Output is captured into a bounded buffer per stream, so a command that decides
+to print a gigabyte does not make the server hold a gigabyte. Each buffer keeps
+a B<head> — the first quarter of the budget, which is where a compiler puts the
+error that matters — and a rolling B<tail> — the remaining three quarters, which
+is where a test runner puts the summary. What falls between them is dropped, and
+the payload says so twice: in the text, and in a report.
+
+=begin code :lang<json>
+{
+  "exit": 0,
+  "stdout": "001 ...\n002 ...\n[... 7176 bytes / 175 lines dropped ...]\n199 ...\n",
+  "stderr": "",
+  "timed-out": false,
+  "truncated": { "stdout": { "bytes": 7176, "lines": 175 } }
+}
+=end code
+
+=item The C<truncated> key is B<only present when something was actually
+dropped>, and only names the streams that dropped something. A run inside its
+budget has exactly the four keys it has always had, byte for byte.
+=item The numbers in the marker and the numbers in C<truncated> are the same
+numbers: both come out of one atomic read of the buffer.
+=item Cuts land on character boundaries, so a multi-byte character is never
+sliced in half.
+=item C<max-output-lines> is enforced alongside C<max-output-bytes>; whichever
+runs out first decides.
+
+The buffer is L<MCP::Server::Tool::Shell::Buffer|Buffer> and is usable on its
+own if you want the same behaviour elsewhere.
+
+=head3 Streaming a run in progress
+
+A 2026-07-28 (modern era) request that opts into logging — C<_meta>
+C<io.modelcontextprotocol/logLevel> of C<info> or lower — gets the command's
+output as C<notifications/message> on that request's own channel while the
+command is still running:
+
+=begin code :lang<json>
+{
+  "jsonrpc": "2.0",
+  "method": "notifications/message",
+  "params": {
+    "level": "info",
+    "logger": "sh_run",
+    "data": { "stream": "stdout", "text": "compiling lib/Thing.rakumod\n" }
+  }
+}
+=end code
+
+=item C<logger> is the prefixed tool name, so a host that plugged several
+instances can tell them apart.
+=item Batches are flushed at least every 0.25s and are never larger than 32 KiB;
+a bigger burst becomes several notifications, in order.
+=item For a run that finished on its own, concatenating every C<stdout> batch
+gives exactly the C<stdout> of the final payload (when nothing was truncated):
+the last flush happens once the command's streams have closed. A run that was
+killed may have written a little more than it managed to stream.
+=item Nothing is streamed for a request that did not opt in, and nothing at all
+is streamed on the legacy era, where notifications travel on one channel shared
+by the whole session and a run's output would surface inside somebody else's
+request. Use a background job for progress on legacy clients.
+
+If the caller hangs up mid-run (an HTTP client closing its response stream), the
+run notices within 0.25s, kills the command and unwinds. The answer it produces
+is a dead letter nobody reads, and is not marked C<timed-out>: the budget was
+never reached.
+
+=head2 Background jobs
+
+C<run> has to answer inside one tool call, which puts a ceiling on what it can
+be asked to do. C<start> escapes that ceiling: it spawns the command, returns a
+handle, and answers immediately.
+
+=begin code :lang<json>
+{ "command": "make", "args": ["-j8", "test"] }
+→ {"job":"j1-1x9k2w","state":"running"}
+=end code
+
+=head3 start
+
+Takes exactly the same arguments as C<run> (C<command>, C<args>, C<cwd>,
+C<stdin>, C<timeout>) and returns C<< { job, state } >>. Its C<timeout> is
+optional and has B<no default>: escaping the foreground budget is the point.
+Starting a job when C<max-jobs> are already running is a caller error, and the
+message names the jobs in the way.
+
+=head3 poll
+
+Takes C<job> and reports how it is getting on, without returning the output:
+
+=begin code :lang<json>
+{"exit":null,"job":"j1-1x9k2w","killed":false,"runtime":12.004,
+ "started-at":"2026-08-09T09:15:03Z","state":"running",
+ "stderr-bytes":0,"stdout-bytes":81920,"timed-out":false}
+=end code
+
+C<state> is C<running>, C<exited> or C<killed>; C<exit> is C<null> until there
+is a status; C<stdout-bytes> and C<stderr-bytes> count everything the command
+has produced, including whatever the buffers have since dropped.
+
+=head3 output
+
+Takes C<job> and an optional C<cursor>, and returns
+C<< { job, state, stdout, stderr, cursor, eof } >> plus C<truncated> when
+something was dropped.
+
+=item B<Without a cursor> you get a capped snapshot of the whole run so far —
+head, marker, tail — exactly as C<run> would have rendered it.
+=item B<With the cursor from a previous call> you get only what has been written
+since, so a long job can be followed a piece at a time. Concatenating the
+instalments reconstructs the output, with a
+C<[... N bytes / M lines dropped ...]> marker wherever the reader fell so far
+behind that the buffer rolled past it.
+=item The cursor is B<opaque>: it carries a position in both streams, in bytes
+and in lines. Pass it back exactly as it was given; anything else is a caller
+error.
+=item C<eof> is true once the job has finished and you have read to the end.
+
+=head3 kill
+
+Takes C<job>, kills it with C<SIGKILL> and returns C<< { job, state, killed } >>
+immediately — collecting the status is the watcher's business, so C<poll> for
+the final state. Killing a job that has already finished changes nothing and is
+not an error.
+
+=head3 Job lifetime
+
+=item At most C<max-jobs> run at once.
+=item A finished job stays pollable for C<job-ttl> seconds, and only the
+C<max-finished-jobs> most recently finished are kept. After that its handle is
+refused with a message saying why — start a new job rather than hoping.
+=item A job does B<not> observe the cancellation of the request that started it:
+that request was answered the moment the handle was minted. Stopping a job is
+explicit, or its own C<timeout>.
+=item Jobs die with the server process. Nothing here survives a restart.
+=item Job ids (C<j3-1x9k2w>) are handles, not secrets: anyone who can call these
+tools can already start jobs of their own.
+
+=head3 Push notifications, honestly
+
+While a job runs, its output and lifecycle events are also pushed as
+C<notifications/message> — output batches at C<debug> (so a legacy client can
+silence them with C<logging/setLevel>) and C<started> / C<exited> / C<killed>
+lines at C<info>, all labelled with the prefixed C<start> tool name. Whether
+they arrive depends on the transport, and this is worth knowing before you build
+a UI on it:
+
+=begin table
+Session                     | Push  | Why
+============================|=======|====================================================
+Legacy stdio, initialized   | Yes   | One client, one transport-wide channel to write on
+Legacy stdio, pre-handshake | No    | Nothing may be sent before the client says it is initialized
+Modern Streamable HTTP      | No    | There is no server-initiated stream between requests
+No transport (in-process)   | No    | Nowhere to write
+=end table
+
+So: B<C<poll> and C<output> are the reliable way to follow a job>, on every
+transport. Push is a bonus where the transport happens to support it, never a
+substitute for polling — and a push channel that refuses or fails never affects
+the job itself, whose output is safe in its buffers either way.
+
+=head3 allowed
+
+Takes no arguments and returns the allow list, sorted, one entry per line:
+
+=begin code
+git
+rg
+/usr/bin/jq
+=end code
+
+Give the LLM this tool and it can discover what it may run instead of guessing
+and collecting errors. In C<allow-any> mode it says so in one line instead.
+
+=head2 Security
+
+This pack is a gate, not a sandbox. What it guarantees:
+
+=item B<Exact-string allowlist> (unless you turn it off). The C<command>
+argument must be C<eq> one of the C<allow> entries. There is no globbing, no
+basename matching, no C<PATH> rewriting and no path normalisation: if you allow
+C</usr/bin/jq> then C<jq> is refused, and if you allow C<git> then
+C</usr/bin/git> is refused. Prefer absolute paths when you care I<which> binary
+runs; prefer bare names when you want C<PATH> resolution (including C<.exe>
+resolution on Windows).
+
+=item B<No shell, ever.> Commands are spawned with C<Proc::Async>, which
+C<exec>s the program directly with the argv vector you supplied. No shell is
+involved at any point, so quoting, word splitting, globbing, redirection,
+pipelines, command substitution and environment-variable expansion simply do not
+happen. C<< args => ['$HOME; rm -rf /'] >> is one argument containing punctuation.
+
+=item B<Argument hygiene.> C<args> must be an array; entries must be strings (or
+numbers, which are stringified) and may not contain NUL bytes, since a NUL would
+silently truncate the argument at the C<exec> boundary. The same goes for
+C<command> itself.
+
+=item B<Bounded runtime.> A foreground run is killed once C<timeout> seconds have
+elapsed and reported with C<timed-out: true>. The kill is C<SIGKILL> — the
+uncatchable signal — rather than a polite C<SIGTERM> first: Rakudo's
+C<Proc::Async> ignores every C<.kill> after the first on a given process, so a
+catchable signal would leave no way to escalate against a child that traps it.
+On Windows C<SIGKILL> is one of the three signals libuv maps onto
+C<TerminateProcess>, which is equally uncatchable. A killed command therefore
+gets no chance to clean up after itself.
+
+=item B<Bounded memory.> Output is capped per stream per run, and a background
+job's buffers are capped the same way however long it runs.
+
+What it deliberately does not do:
+
+=item B<It does not constrain what an allowed command can do.> Allowlisting an
+interpreter or a shell (C<sh>, C<bash>, C<pwsh>, C<raku>, C<python>) hands over
+arbitrary code execution, because those programs take code as an argument.
+Allowlist leaf tools, not launchers.
+
+=item B<It does not filter arguments.> C<git> can push, C<rg> can read any file
+the server user can read, and C<cwd> is unrestricted unless you leave it unset
+and only allow commands that ignore it. Run the server as a user whose
+privileges you are comfortable handing to the model.
+
+=item B<It does not scrub the environment.> Children inherit the server
+process's environment, including any credentials in it.
+
+=item B<It only kills the command itself.> Grandchildren the command spawned may
+outlive a kill, and can hold the pipes open long enough for the exit status to
+be lost (reported as C<exit: null>).
+
+=head3 Running anything: allow-any and MCP::Client::Policy
+
+C<< allow-any => True >> removes the allow list entirely. Everything else stays:
+no shell, argv vectors, NUL rejection, capped output, timeouts, jobs. What is
+gone is the decision about I<what may run> — this pack will run anything the
+server's user can run, including a shell, including C<rm>.
+
+That is only a sane configuration if the decision is being made somewhere else.
+The intended pairing is a policy layer on the client side, such as
+C<MCP::Client::Policy>, whose rules are name-based and whose default for an
+unmatched tool is to ask a human:
+
+=begin code :lang<raku>
+# Server: no allow list, because the client is where consent lives.
+$server.plug: MCP::Server::Tool::Shell.new(:allow-any);
+=end code
+
+With a policy in front, C<sh_run> and C<sh_start> match no allow rule, so every
+call is put to the user before it happens — which is a better gate than a static
+list for an interactive coding agent, and a much worse one for an unattended
+server. If nothing is asking a human, use C<allow>.
+
+=head3 Windows notes
+
+=item Bare names resolve the way C<CreateProcess> resolves them, so C<< allow =>
+<git> >> runs C<git.exe> off C<PATH>. Allowlist the string you want the caller to
+I<pass> (C<git>), not the file that ends up being executed (C<git.exe>) — the
+match happens before any resolution.
+=item Arguments are still a vector: Rakudo quotes each entry for
+C<CreateProcess>, so an argument containing spaces stays one argument.
+=item A kill becomes C<TerminateProcess>, which the command cannot trap or
+delay. There are no signals, so there is no C<128 + signal> exit status: a
+killed run or job reports whatever C<TerminateProcess> left behind (C<1>, in
+practice). Test for C<exit != 0> rather than for C<137>.
+=item Everything else — stdin, capped output, streaming, jobs — behaves the same
+as on Unix.
+
+=head2 Examples
+
+=item C<examples/shell-server.raku> — a git + ripgrep server, with the
+invocation line in the header.
+
+=head2 See Also
+
+=item L<MCP::Server|https://github.com/m-doughty/MCP-Server> — the server
+framework, the C<MCP::Server::Toolkit> role this pack implements, and the
+C<raku-mcp> command.
+
+=head2 Author
+
+Matt Doughty
+
+=head2 License
+
+Artistic-2.0
+
+=end pod

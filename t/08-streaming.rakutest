@@ -1,0 +1,292 @@
+use Test;
+use lib 't/lib';
+use ShellTest;
+use JSON::Fast;
+use MCP::Server;
+use MCP::Server::Protocol;
+use MCP::Server::Transport;
+use MCP::Server::Tool::Shell;
+
+# Two notification paths, and they are not the same path.
+#
+# A foreground run streams on the channel of the request it is serving: modern
+# era only, opt-in only, flushed from the handler thread.  A background job has
+# no request to hang anything off by the time it produces output, so it goes
+# through MCP::Server.notify instead — which reaches a legacy stdio session's
+# transport-wide channel and, honestly, nothing at all on Streamable HTTP,
+# where there is no server-initiated stream between requests.  Both halves are
+# tested here, including the half that delivers nothing.
+
+plan 7;
+
+my $raku = raku-path();
+
+#| Transport that plays a canned script of inbound lines and records everything
+#| the server writes.  Locked, because a job flusher writes to it from its own
+#| thread after the session's run loop has returned.
+class ScriptedTransport does MCP::Server::Transport {
+	has @.inbound is rw;
+	has Lock $!lock .= new;
+	has @!written;
+
+	method read-message(--> Str) { @!inbound.elems ?? @!inbound.shift !! Str }
+	method write-message(Str:D $msg) { $!lock.protect: { @!written.push($msg) } }
+	method messages(--> List) {
+		# Taken under the lock first: a method call chained straight onto
+		# .protect's block would become part of the block's own expression.
+		my @raw = $!lock.protect: { @!written.List };
+		@raw.map({ from-json($_) }).list;
+	}
+}
+
+#| Stand-in for $*ERR so the server's own log lines land in an array instead of
+#| the test output.
+class ErrSink {
+	has @.lines;
+	method say(*@args) { @!lines.push: @args.join; True }
+	method print(*@args) { @!lines.push: @args.join; True }
+	method flush(--> Bool:D) { True }
+}
+
+#| A server that only records what it is asked to deliver, so the job push path
+#| can be tested without a transport underneath it.  :accept False is what
+#| MCP::Server.notify answers when there is no channel — a Streamable HTTP
+#| session between requests, say.
+class StubServer {
+	has Bool:D $.accept = True;
+	has Bool:D $.explode = False;
+	has Lock $!lock .= new;
+	has @!notifications;
+
+	method notify(%notif --> Bool:D) {
+		die 'this server has gone away' if $!explode;
+		$!lock.protect: { @!notifications.push(%notif) };
+		$!accept;
+	}
+
+	method notifications(--> List) { $!lock.protect: { @!notifications.List } }
+	method lines(Str:D $level --> List) {
+		self.notifications.grep({ $_<params><level> eq $level }).map({ $_<params><data> }).list;
+	}
+}
+
+#| A registrar double: enough of the facade for a kit to register against, with
+#| the tool handlers kept where a test can call them directly.
+class StubRegistrar {
+	has $.server;
+	has %.handlers;
+
+	method prefixed(Str:D $name --> Str:D) { "sh_$name" }
+	method tool(Str:D $name, Str :$description, :%params, :&handler!) {
+		%!handlers{$name} = &handler;
+	}
+}
+
+sub shell-server(*%config --> MCP::Server:D) {
+	my $server = MCP::Server.new(:name<streaming>, :version<1.0.0>);
+	$server.plug: MCP::Server::Tool::Shell.new(allow => [$raku], |%config);
+	$server;
+}
+
+subtest 'A modern request that opted in is streamed as it goes' => {
+	plan 8;
+	my $server = shell-server;
+	my $sink = notify-sink();
+
+	my $source = '$*OUT.out-buffer = 0; for ^3 { print "part$_\n"; note "note$_"; sleep 0.3 }';
+	my %response = modern-call($server, 'sh_run',
+		{ command => $raku, args => ['-e', $source] },
+		log-level => 'info', :$sink,
+	);
+	nok %response<result><isError>, 'The call succeeded';
+	my %payload = from-json(%response<result><content>[0]<text>);
+
+	my @messages = $sink.messages;
+	ok @messages.elems > 0, 'Something was streamed';
+	ok @messages.all<level> eq 'info', 'Streamed output is info level';
+	ok @messages.all<logger> eq 'sh_run', 'and is labelled with the prefixed tool name';
+	ok @messages.all<data> ~~ Associative, 'The payload is an object';
+
+	is $sink.stream('stdout').join, %payload<stdout>,
+		'The streamed stdout batches add up to exactly the payload';
+	is $sink.stream('stderr').join, %payload<stderr>,
+		'and so do the stderr ones';
+	ok @messages.grep({ $_<data><stream> eq 'stderr' }).elems > 0,
+		'Both streams are labelled and carried';
+};
+
+subtest 'A request that did not opt in gets no streaming' => {
+	plan 3;
+	my $server = shell-server;
+
+	my $quiet = notify-sink();
+	my %response = modern-call($server, 'sh_run',
+		{ command => $raku, args => ['-e', 'print "silent"'] },
+		sink => $quiet,
+	);
+	is $quiet.messages.elems, 0,
+		'A modern request with no logLevel gets no notifications/message';
+	is from-json(%response<result><content>[0]<text>)<stdout>, 'silent',
+		'and still gets its answer';
+
+	my $raised = notify-sink();
+	modern-call($server, 'sh_run',
+		{ command => $raku, args => ['-e', 'print "quiet"'] },
+		log-level => 'error', sink => $raised,
+	);
+	is $raised.messages.elems, 0,
+		'and neither does one that only asked for errors';
+};
+
+subtest 'A legacy session gets no run streaming at all' => {
+	plan 3;
+	# Legacy notifications travel on one channel shared by the whole session, so
+	# a run's output would land in somebody else's request.  Jobs are the legacy
+	# progress story, not this.
+	my $server = shell-server;
+	my $transport = ScriptedTransport.new(inbound => [
+		to-json({ jsonrpc => '2.0', id => 1, method => 'initialize', params => {} }, :!pretty),
+		to-json({ jsonrpc => '2.0', method => 'notifications/initialized' }, :!pretty),
+		to-json({
+			jsonrpc => '2.0', id => 2, method => 'tools/call',
+			params => {
+				name => 'sh_run',
+				arguments => { command => $raku, args => ['-e', 'print "legacy"'] },
+			},
+		}, :!pretty),
+	].Array);
+
+	{
+		my $*ERR = ErrSink.new;
+		$server.run(:$transport);
+	}
+
+	my @messages = $transport.messages;
+	my @streamed = @messages.grep({
+		($_<method> // '') eq 'notifications/message' && ($_<params><logger> // '') eq 'sh_run'
+	});
+	is @streamed.elems, 0, 'Nothing was streamed for the run';
+
+	my %response = @messages.first({ ($_<id> // 0) == 2 });
+	ok %response.defined, 'The call was answered';
+	is from-json(%response<result><content>[0]<text>)<stdout>, 'legacy',
+		'with the whole of the output in the payload';
+};
+
+subtest 'Streamed batches are bounded' => {
+	plan 4;
+	my $server = shell-server;
+	my $sink = notify-sink();
+
+	# 100 kB in one write: below the 128 kB capture budget (so nothing is
+	# dropped) and well above the 32 kB notification batch.
+	my %response = modern-call($server, 'sh_run',
+		{ command => $raku, args => ['-e', 'print "x" x 100_000'] },
+		log-level => 'debug', :$sink,
+	);
+	my %payload = from-json(%response<result><content>[0]<text>);
+	is %payload<stdout>.chars, 100_000, 'The whole write is in the payload';
+	nok %payload<truncated>:exists, 'and none of it was dropped';
+
+	my @batches = $sink.stream('stdout');
+	ok @batches.map({ .encode('utf-8').bytes }).all <= 32768,
+		'No batch is bigger than 32 KiB';
+	is @batches.join, %payload<stdout>, 'and together they are the output again';
+};
+
+subtest 'Background jobs push on the server channel' => {
+	plan 8;
+	my $kit = MCP::Server::Tool::Shell.new(allow => [$raku]);
+	my $server = StubServer.new;
+	# Registered twice against the same server: a kit may be plugged into
+	# several servers, but it must not push twice to one of them.
+	my $first = StubRegistrar.new(server => $server);
+	$kit.register($first);
+	$kit.register(StubRegistrar.new(server => $server));
+
+	my %start = from-json($first.handlers<start>(args => {
+		command => $raku, args => ['-e', '$*OUT.out-buffer = 0; print "job output\n"; note "job noise"'],
+	}));
+	my $id = %start<job>;
+
+	ok wait-until({ $server.lines('info').grep({ .contains('exited') }).elems > 0 }),
+		'The job announced that it had finished';
+
+	my @info = $server.lines('info');
+	is @info.grep({ .contains('started') }).elems, 1,
+		'It announced its start exactly once, however many times the kit was registered';
+	ok @info.all.contains($id), 'Every lifecycle line names the job';
+	ok $server.notifications.all<params><logger> eq 'sh_start',
+		'and is labelled with the prefixed start tool';
+	ok $server.notifications.all<method> eq 'notifications/message',
+		'All of it is a logging notification';
+
+	my @debug = $server.lines('debug');
+	ok @debug.grep({ .contains('job output') }).elems > 0,
+		'Output batches are pushed at debug level, where a client can silence them';
+	ok @debug.grep({ .contains('job noise') }).elems > 0, 'stderr included';
+	ok @debug.all.contains($id), 'and each batch says which job and stream it came from';
+};
+
+subtest 'A push channel that refuses or throws leaves the job alone' => {
+	plan 6;
+	for (StubServer.new(accept => False), StubServer.new(:explode)) -> $server {
+		my $kit = MCP::Server::Tool::Shell.new(allow => [$raku]);
+		my $registrar = StubRegistrar.new(:$server);
+		$kit.register($registrar);
+
+		my %start = from-json($registrar.handlers<start>(args => {
+			command => $raku, args => ['-e', 'print "unheard"'],
+		}));
+
+		my $poll = $registrar.handlers<poll>;
+		ok wait-until({ from-json($poll(args => { job => %start<job> }))<state> ne 'running' }),
+			'The job finished anyway';
+
+		my %status = from-json($poll(args => { job => %start<job> }));
+		is %status<exit>, 0, 'with its own exit status';
+
+		my %out = from-json($registrar.handlers<output>(args => { job => %start<job> }));
+		is %out<stdout>, 'unheard', 'and its output waiting to be polled for';
+	}
+};
+
+subtest 'Job push reaches a legacy stdio session' => {
+	plan 4;
+	# The half of the matrix that does deliver: one client, one channel, and a
+	# server that has said it is initialized.
+	my $server = shell-server;
+	my $transport = ScriptedTransport.new(inbound => [
+		to-json({ jsonrpc => '2.0', id => 1, method => 'initialize', params => {} }, :!pretty),
+		to-json({ jsonrpc => '2.0', method => 'notifications/initialized' }, :!pretty),
+		to-json({
+			jsonrpc => '2.0', id => 2, method => 'tools/call',
+			params => {
+				name => 'sh_start',
+				arguments => { command => $raku, args => ['-e', 'print "pushed"'] },
+			},
+		}, :!pretty),
+	].Array);
+
+	{
+		my $*ERR = ErrSink.new;
+		$server.run(:$transport);
+	}
+
+	my %started = $transport.messages.first({ ($_<id> // 0) == 2 });
+	ok %started.defined, 'The job was started through the session';
+
+	my $id = from-json(%started<result><content>[0]<text>)<job>;
+	ok wait-until({
+		$transport.messages.grep({
+			($_<params><logger> // '') eq 'sh_start' && ($_<params><data> // '').contains('exited')
+		}).elems > 0
+	}), 'Its lifecycle reached the transport-wide channel';
+
+	my @pushed = $transport.messages.grep({ ($_<params><logger> // '') eq 'sh_start' });
+	ok @pushed.grep({ $_<params><data>.contains('pushed') }).elems > 0,
+		'and so did its output';
+	ok @pushed.all<params><data>.contains($id), 'Every pushed line names the job';
+};
+
+done-testing;

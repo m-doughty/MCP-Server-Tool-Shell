@@ -1,0 +1,675 @@
+use JSON::Fast;
+use MCP::Server::Protocol;
+use MCP::Server::Toolkit;
+use MCP::Server::Tool::Shell::Buffer;
+use MCP::Server::Tool::Shell::Jobs;
+
+#| A command runner for MCP::Server.  Commands are always spawned as an argv
+#| vector (never through a shell), output is captured into capped buffers, and
+#| every run is bounded — by a timeout in the foreground, by an explicit kill in
+#| the background.
+#|
+#| Which commands may run is decided one of two ways: an exact-string allow list
+#| (.allow), or .allow-any for deployments that gate consent somewhere else —
+#| an MCP::Client::Policy in front of the tools, or a human watching the
+#| session.  One or the other, never both, never neither.
+unit class MCP::Server::Tool::Shell does MCP::Server::Toolkit;
+
+#| Exact argv0 strings that may be executed, e.g. <git rg /usr/bin/jq>.  The
+#| caller's "command" argument must be `eq` one of these — no globbing, no
+#| basename matching, no PATH rewriting.  Leave it empty only in .allow-any
+#| mode.
+has @.allow;
+
+#| Run anything the caller asks for, with no allow list at all.  For hosts that
+#| take consent seriously somewhere else in the stack (MCP::Client::Policy's
+#| "ask when no rule matches" covers these tools with zero configuration); a
+#| server that turns this on hands whoever can call it the privileges of the
+#| user it runs as.
+has Bool:D $.allow-any = False;
+
+#| Default working directory for every run; the "cwd" argument overrides it.
+has IO::Path() $.cwd;
+
+#| Wall-clock budget, in seconds, for a single foreground run.  The "timeout"
+#| argument overrides it per call; background jobs have no default budget.
+has Real:D $.timeout = 30;
+
+#| Retained output per stream per run, in UTF-8 bytes.  What does not fit is
+#| dropped out of the middle and reported (see MCP::Server::Tool::Shell::Buffer).
+has Int:D $.max-output-bytes = 131072;
+
+#| Retained output per stream per run, in lines.
+has Int:D $.max-output-lines = 2000;
+
+#| How many background jobs may run at once.
+has Int:D $.max-jobs = 4;
+
+#| How many finished jobs stay pollable; the oldest is forgotten first.
+has Int:D $.max-finished-jobs = 16;
+
+#| Seconds a finished job stays pollable before it is forgotten.
+has Real:D $.job-ttl = 600;
+
+# How long to wait for the exit promise to settle after a kill before giving up
+# and reporting the run with an unknown exit status.
+my constant KILL-GRACE = 5;
+
+# How often the foreground run loop wakes to flush output, notice a caller who
+# has hung up, and check the deadline.  Small enough that a cancelled call dies
+# promptly, large enough that a quiet minute costs a few hundred wakeups.
+my constant POLL-INTERVAL = 0.25;
+
+# Largest notification payload one foreground flush carries; a longer batch is
+# split.  Notifications share a transport with responses, and a multi-megabyte
+# one would stall everything queued behind it.
+my constant NOTIFY-BATCH-BYTES = 32768;
+
+# Floors on the output caps.  Below these a run reports more marker than
+# output, which is not a configuration anybody wants on purpose.
+my constant MIN-OUTPUT-BYTES = 1024;
+my constant MIN-OUTPUT-LINES = 10;
+
+# The servers this kit has been plugged into, for pushing job output out of
+# band.  Private (no accessor) on purpose: it is wiring rather than
+# configuration, and from-config validates against the public attributes.
+# Written at register time -- before any job can exist -- and read from job
+# flusher threads afterwards.
+has @!servers;
+
+# Tool names as the client sees them, used as the "logger" of every
+# notification this pack emits so a host can tell one plugged kit from another.
+has Str:D $!run-logger = 'run';
+has Str:D $!job-logger = 'start';
+
+has $!jobs;
+
+submethod TWEAK {
+	# One gate or the other.  Setting both asks two contradictory questions of
+	# every call, and setting neither leaves a runner that can run nothing --
+	# almost always a forgotten setting rather than a decision.
+	die 'Shell toolkit allow and allow-any are mutually exclusive: an allow '
+	  ~ 'list is a decision about what may run, and allow-any is the decision '
+	  ~ 'not to make it here'
+		if $!allow-any && @!allow.elems > 0;
+
+	die 'Shell toolkit requires a non-empty allow list (or allow-any => True '
+	  ~ 'when consent is enforced elsewhere, e.g. by an MCP::Client::Policy)'
+		unless $!allow-any || @!allow.elems > 0;
+
+	if @!allow.grep({ $_ !~~ Str:D || .chars == 0 }).map(*.raku).sort -> @bad {
+		die "Shell toolkit allow list entries must be non-empty strings; got: {@bad.join(', ')}";
+	}
+
+	with $!cwd {
+		die "Shell toolkit cwd is not an existing directory: {.Str}" unless .d;
+	}
+
+	die "Shell toolkit timeout must be greater than zero, got {$!timeout}"
+		unless $!timeout > 0;
+
+	die "Shell toolkit max-output-bytes must be at least {MIN-OUTPUT-BYTES}, got {$!max-output-bytes}"
+		unless $!max-output-bytes >= MIN-OUTPUT-BYTES;
+
+	die "Shell toolkit max-output-lines must be at least {MIN-OUTPUT-LINES}, got {$!max-output-lines}"
+		unless $!max-output-lines >= MIN-OUTPUT-LINES;
+
+	# The registry validates max-jobs / max-finished-jobs / job-ttl, so those
+	# rules live in one place and a directly-built Registry gets them too.
+	$!jobs = MCP::Server::Tool::Shell::Jobs::Registry.new(
+		ttl => $!job-ttl,
+		max-jobs => $!max-jobs,
+		max-finished => $!max-finished-jobs,
+	);
+}
+
+method default-prefix(--> Str) { 'sh' }
+
+method register($registrar) {
+	# A job outlives the request that started it, so its output cannot go out on
+	# that request's notification channel.  The server can take it instead --
+	# and a kit may be plugged into more than one, so they accumulate.
+	my $server = $registrar.?server;
+	@!servers.push($server)
+		if $server.defined && !@!servers.first({ $_ === $server }).defined;
+
+	$!run-logger = $registrar.?prefixed('run') // 'run';
+	$!job-logger = $registrar.?prefixed('start') // 'start';
+
+	$registrar.tool: 'allowed',
+		description => $!allow-any
+			?? 'Report which commands this shell toolkit may run.  This one has no '
+			  ~ 'allow list: any command the server user can execute is available.'
+			!! 'List the commands this shell toolkit is allowed to run, one per line',
+		handler => -> :%args { self!allowed };
+
+	$registrar.tool: 'run',
+		description => "Run { $!allow-any ?? 'a command' !! 'an allowlisted command' } with the given arguments and "
+		  ~ 'wait for it to finish, returning a JSON object with the keys exit, '
+		  ~ 'stdout, stderr and timed-out.  Arguments are passed straight to the '
+		  ~ 'program as an argv vector: there is no shell, so no quoting, '
+		  ~ 'globbing, redirection, pipes or variable interpolation happen.  '
+		  ~ 'Output is capped: when a run produces more than the server keeps, '
+		  ~ 'the middle is dropped and a "truncated" key says how much.  Use the '
+		  ~ 'companion "start" tool instead for work that will outlast a single '
+		  ~ 'tool call, and "allowed" to see which commands are available.',
+		params => self!run-params('this run'),
+		handler => -> :%args { self!run(%args) };
+
+	$registrar.tool: 'start',
+		description => "Start { $!allow-any ?? 'a command' !! 'an allowlisted command' } in the background and return "
+		  ~ 'a JSON object with a job handle and its state.  Use it for work that '
+		  ~ 'would outlast the "run" tool: builds, test suites, long transfers.  '
+		  ~ 'The command keeps running after this call answers; "poll" reports how '
+		  ~ 'it is getting on, "output" returns what it has written, and "kill" '
+		  ~ 'stops it.  Arguments are an argv vector exactly as for "run" — there '
+		  ~ 'is still no shell.',
+		params => self!run-params('this job'),
+		handler => -> :%args { self!start(%args) };
+
+	$registrar.tool: 'poll',
+		description => 'Report the state of a background job as a JSON object: '
+		  ~ 'state (running, exited or killed), exit status once there is one, '
+		  ~ 'timed-out, killed, started-at, runtime in seconds, and how many bytes '
+		  ~ 'each stream has produced.  Does not return the output itself — that is '
+		  ~ 'the "output" tool.',
+		params => { job => self!job-param },
+		handler => -> :%args { self!poll(%args) };
+
+	$registrar.tool: 'output',
+		description => 'Return a background job\'s output as a JSON object with the '
+		  ~ 'keys job, state, stdout, stderr, cursor and eof.  Called without a '
+		  ~ 'cursor it returns a capped snapshot of the whole run so far; called '
+		  ~ 'with the cursor from a previous call it returns only what has been '
+		  ~ 'written since, so a long job can be followed a piece at a time.  Keep '
+		  ~ 'going until eof is true.',
+		params => {
+			job => self!job-param,
+			cursor => {
+				type => 'string',
+				description => 'The cursor from a previous call to this tool.  '
+				  ~ 'Opaque: pass it back exactly as it was given.  Omit it to get '
+				  ~ 'a snapshot of everything the job has produced.',
+			},
+		},
+		handler => -> :%args { self!output(%args) };
+
+	$registrar.tool: 'kill',
+		description => 'Kill a background job (SIGKILL, which it cannot catch or '
+		  ~ 'delay) and return a JSON object with the job, its state and whether a '
+		  ~ 'kill is in force.  Returns immediately, so poll for the final state.  '
+		  ~ 'Killing a job that has already finished changes nothing.',
+		params => { job => self!job-param },
+		handler => -> :%args { self!kill(%args) };
+}
+
+# The parameter block "run" and "start" share.  $what names the call in the
+# descriptions so neither tool talks about the other's lifetime.
+method !run-params(Str:D $what --> Hash) {
+	{
+		command => {
+			type => 'string',
+			description => $!allow-any
+				?? 'Command to run.  Any executable the server user can run is allowed.'
+				!! 'Command to run.  Must match one of the allowlisted strings '
+				  ~ 'exactly (see the "allowed" tool).',
+			required => True,
+		},
+		args => {
+			type => 'array',
+			description => 'Arguments passed to the command, one array entry per '
+			  ~ 'argument.  Entries are strings; an entry containing spaces stays '
+			  ~ 'a single argument.',
+		},
+		cwd => {
+			type => 'string',
+			description => "Working directory for $what.  Overrides the toolkit "
+			  ~ 'default; must be an existing directory.',
+		},
+		stdin => {
+			type => 'string',
+			description => 'Text written to the command\'s standard input, which is '
+			  ~ 'then closed.  An empty string means "no input, EOF immediately".  '
+			  ~ 'Omit it entirely to leave standard input unconnected.',
+		},
+		timeout => {
+			type => 'number',
+			description => $what eq 'this job'
+				?? 'Seconds before the job is killed.  Omit it and the job runs '
+				  ~ 'until it finishes or is killed.'
+				!! 'Seconds to wait before killing the command, overriding the '
+				  ~ 'server default for this call.',
+		},
+	}
+}
+
+method !job-param(--> Hash) {
+	{
+		type => 'string',
+		description => 'Job handle, as returned by the "start" tool.',
+		required => True,
+	}
+}
+
+# === Tool bodies ===
+#
+# Everything that is the caller's fault (unknown command, bad argument shape,
+# missing directory, unknown job) dies so MCP::Server turns it into an isError
+# result; everything that is a runtime condition of the command itself
+# (non-zero exit, missing binary, timeout) is reported in the JSON payload.
+
+method !allowed(--> Str:D) {
+	return 'Any command may be run: this toolkit has no allow list.' if $!allow-any;
+	@!allow.sort.join("\n");
+}
+
+#| Validate the caller's arguments, then run the command in the foreground and
+#| wait for it.
+method !run(%args --> Str:D) {
+	my %plan = self!validate(%args);
+	my Real:D $timeout = self!timeout-for(%args, $!timeout);
+	self!execute(%plan, $timeout);
+}
+
+#| Validate the caller's arguments, admit a job, and spawn it.
+method !start(%args --> Str:D) {
+	my %plan = self!validate(%args);
+	my Real $timeout = self!timeout-for(%args, Real);
+
+	my @streams = (^2).map({
+		MCP::Server::Tool::Shell::Buffer.new(
+			max-bytes => $!max-output-bytes,
+			max-lines => $!max-output-lines,
+		)
+	});
+
+	# Only wire a push channel when there is a server to push to: without one a
+	# job would keep a second copy of its output around for nobody to read.
+	my &notify = @!servers.elems > 0
+		?? -> Str:D $level, Str:D $line { self!push($level, $line) }
+		!! Callable;
+
+	# Bound to a variable of its own rather than passed straight out of the
+	# hash: a list living in a hash value is itemised, and would arrive as one
+	# argument that happens to be an array.
+	my Str @argv = %plan<argv>.list;
+
+	my $job = $!jobs.admit(-> Str:D $id {
+		MCP::Server::Tool::Shell::Jobs::Job.new(
+			:$id,
+			command => %plan<command>,
+			args => @argv,
+			dir => %plan<dir>,
+			stdin => %plan<stdin>,
+			|($timeout.defined ?? (:$timeout) !! ()),
+			stdout => @streams[0],
+			stderr => @streams[1],
+			:&notify,
+			on-finish => { Promise.in($!job-ttl).then({ $!jobs.reap }) },
+		)
+	});
+
+	without $job {
+		my @running = $!jobs.running-ids;
+		die "Too many jobs already running ({@running.join(', ')}); the limit is "
+		  ~ "{$!max-jobs}. Wait for one to finish, or kill it with the \"kill\" tool.";
+	}
+
+	$job.spawn;
+
+	to-json({ job => $job.id, state => 'running' }, :!pretty, :sorted-keys);
+}
+
+method !poll(%args --> Str:D) {
+	my $job = self!job(%args);
+	# Copied rather than composed with a slip: a hash composer that opens with
+	# |%status parses as a block, and the first thing that notices is to-json.
+	my %payload = $job.status;
+	%payload<stdout-bytes> = $job.stdout.stats<bytes>;
+	%payload<stderr-bytes> = $job.stderr.stats<bytes>;
+
+	to-json(%payload, :!pretty, :sorted-keys);
+}
+
+method !output(%args --> Str:D) {
+	my $job = self!job(%args);
+	my @at = self!cursor(%args<cursor>);
+
+	# State first, output second: a job that finishes between the two reads has
+	# already written everything it is going to, so a read that follows a
+	# terminal state is complete.  The other order could report eof on a job
+	# that was still writing.
+	my %status = $job.status;
+	my %out = $job.stdout.read-from(@at[0], @at[1]);
+	my %err = $job.stderr.read-from(@at[2], @at[3]);
+
+	my %payload =
+		job => $job.id,
+		state => %status<state>,
+		stdout => %out<text>,
+		stderr => %err<text>,
+		cursor => cursor-token(%out, %err),
+		eof => %status<state> ne 'running';
+
+	my %truncated = self!truncation(%out, %err);
+	%payload<truncated> = %truncated if %truncated.elems > 0;
+
+	to-json(%payload, :!pretty, :sorted-keys);
+}
+
+method !kill(%args --> Str:D) {
+	my $job = self!job(%args);
+	my Bool:D $killed = $job.kill;
+
+	to-json(
+		{ job => $job.id, state => $job.status<state>, killed => $killed },
+		:!pretty,
+		:sorted-keys,
+	);
+}
+
+# === Argument validation ===
+
+#| Everything "run" and "start" agree on: the command, its argv vector, the
+#| working directory and the standard input, all checked before anything is
+#| spawned.
+method !validate(%args --> Hash) {
+	my $command = %args<command>;
+	die "'command' is required and must be a non-empty string"
+		unless $command ~~ Str:D && $command.chars > 0;
+	# A NUL would silently truncate the path at the exec boundary, so the
+	# program that ran would not be the program that was checked.
+	die "'command' must not contain NUL bytes" if $command.contains("\0");
+
+	die "Command '$command' is not allowlisted. Allowed: {@!allow.sort.join(', ')}"
+		unless $!allow-any || so @!allow.any eq $command;
+
+	my @argv = self!argv(%args<args>);
+
+	my $dir = do with %args<cwd> {
+		die "'cwd' must be a non-empty string" unless $_ ~~ Str:D && .chars > 0;
+		.IO;
+	} else {
+		$!cwd;
+	};
+	with $dir {
+		die "Working directory does not exist: {.Str}" unless .d;
+	}
+
+	my Str $stdin;
+	with %args<stdin> {
+		die "'stdin' must be a string, got a {.^name}" unless $_ ~~ Str:D;
+		# NUL bytes are fine here, unlike in argv: this is a byte stream, not a
+		# C string, and a program that wants one can have one.
+		$stdin = $_;
+	}
+
+	{ command => $command, argv => @argv, dir => $dir, stdin => $stdin }
+}
+
+#| Coerce the "args" argument into a list of plain strings, rejecting shapes a
+#| program cannot receive (nested structures, NUL bytes).
+method !argv($raw --> List) {
+	return () without $raw;
+
+	die "'args' must be an array of strings, got a {$raw.^name}"
+		unless $raw ~~ Positional;
+
+	my Str @argv;
+	for $raw.list.kv -> $index, $arg {
+		die "'args' entries must be strings; entry $index is a {$arg.^name}"
+			unless $arg ~~ Str:D || ($arg ~~ Numeric:D && $arg !~~ Bool);
+		my Str $value = $arg.Str;
+		die "'args' entries must not contain NUL bytes; entry $index does"
+			if $value.contains("\0");
+		@argv.push: $value;
+	}
+
+	@argv.List;
+}
+
+#| The budget for this call: the "timeout" argument when there is one, the
+#| given default otherwise.  A Bool is not a number however much Raku's type
+#| hierarchy would like it to be, and neither NaN nor Inf is a deadline.
+method !timeout-for(%args, Real $default --> Real) {
+	my $value = %args<timeout>;
+	return $default without $value;
+
+	die "'timeout' must be a number of seconds, got a {$value.^name}"
+		unless $value ~~ Real:D && $value !~~ Bool;
+	die "'timeout' must be a finite number of seconds, got {$value}"
+		if $value.Num.isNaN || $value.Num == Inf || $value.Num == -Inf;
+	die "'timeout' must be greater than zero, got {$value}"
+		unless $value > 0;
+
+	$value;
+}
+
+#| The job named by the caller's "job" argument.
+method !job(%args) {
+	my $id = %args<job>;
+	die "'job' is required and must be a non-empty string"
+		unless $id ~~ Str:D && $id.chars > 0;
+
+	my $job = $!jobs.get($id);
+	without $job {
+		die "Unknown job '$id'. Either it never existed, or it has been forgotten: "
+		  ~ "finished jobs are kept for {$!job-ttl} seconds and only the "
+		  ~ "{$!max-finished-jobs} most recent are remembered.";
+	}
+	$job;
+}
+
+# === Execution ===
+
+#| Spawn the planned command, capture both streams into capped buffers, and
+#| return the JSON result.  Proc::Async only: there is no shell anywhere in
+#| this path, so the arguments reach the program exactly as the caller wrote
+#| them.
+method !execute(%plan, Real:D $timeout --> Str:D) {
+	my $ctx = $*MCP-REQUEST-CONTEXT;
+
+	# Streaming is modern-era only and opt-in per request.  The legacy era's
+	# only opt-out lives inside MCP::Server.log, which this bypasses on purpose
+	# (a legacy session's shared channel would carry another request's output
+	# into this one), so legacy callers get their progress from jobs instead.
+	my Bool:D $streaming = $ctx.defined && $ctx.era eq 'modern' && $ctx.wants-log('info');
+
+	my $out = MCP::Server::Tool::Shell::Buffer.new(
+		max-bytes => $!max-output-bytes, max-lines => $!max-output-lines,
+	);
+	my $err = MCP::Server::Tool::Shell::Buffer.new(
+		max-bytes => $!max-output-bytes, max-lines => $!max-output-lines,
+	);
+
+	# Taps append and nothing else.  They run on scheduler threads, and
+	# emitting a notification from one would both block the child's pipe behind
+	# a transport write and hand the request's sink to a thread it was never
+	# promised to; the loop below flushes on the handler thread instead.
+	my $pending-lock = Lock.new;
+	my %pending;
+
+	my $stdin = %plan<stdin>;
+	# :w only when there is something to write: an open pipe nobody writes to
+	# is not the same as an unconnected standard input, and a run that passes
+	# no stdin must behave exactly as it did before stdin existed.
+	my $proc = $stdin.defined
+		?? Proc::Async.new(:w, %plan<command>, |%plan<argv>)
+		!! Proc::Async.new(%plan<command>, |%plan<argv>);
+
+	# The quit handlers are load-bearing: when the spawn itself fails both output
+	# supplies quit with the spawn exception, and an unhandled quit runs on a
+	# scheduler thread — which would take the whole server process down instead
+	# of breaking the promise we are about to inspect.
+	$proc.stdout.tap(
+		-> $chunk {
+			$out.add($chunk);
+			if $streaming {
+				$pending-lock.protect: { %pending<stdout> = (%pending<stdout> // '') ~ $chunk };
+			}
+		},
+		quit => -> $ex { },
+	);
+	$proc.stderr.tap(
+		-> $chunk {
+			$err.add($chunk);
+			if $streaming {
+				$pending-lock.protect: { %pending<stderr> = (%pending<stderr> // '') ~ $chunk };
+			}
+		},
+		quit => -> $ex { },
+	);
+
+	my $done = $proc.start(|(cwd => .absolute with %plan<dir>));
+
+	with $stdin {
+		# Detached on purpose: a child that never reads its standard input would
+		# otherwise stall this handler for as long as it runs, and a child that
+		# exits early makes the write fail with EPIPE, which is a runtime
+		# condition rather than a caller error.
+		my $feed = $_;
+		start { try await $proc.print($feed); try $proc.close-stdin }
+	}
+
+	my $deadline = now + $timeout;
+	my Bool $timed-out = False;
+	my Bool $cancelled = False;
+
+	# One wait per quarter second rather than one long anyof: the loop is what
+	# lets a run stream its output, notice a caller who has hung up, and still
+	# stop on the deadline.
+	loop {
+		my $slice = $deadline - now;
+		$slice = POLL-INTERVAL if $slice > POLL-INTERVAL;
+		await Promise.anyof($done, Promise.in($slice)) if $slice > 0;
+
+		self!flush($ctx, $pending-lock, %pending) if $streaming;
+
+		# NB: promise settlement is checked via .status, never boolification —
+		# a Promise is always truthy.
+		last unless $done.status === Planned;
+
+		if $ctx.defined && $ctx.cancelled {
+			$cancelled = True;
+			last;
+		}
+		if now >= $deadline {
+			$timed-out = True;
+			last;
+		}
+	}
+
+	if $timed-out || $cancelled {
+		# SIGKILL straight away rather than TERM-then-KILL: Rakudo ignores every
+		# .kill after the first on a given Proc::Async, so a catchable signal
+		# first would leave no way to escalate against a child that traps it.
+		# SIGKILL is also the portable choice — on Windows it is one of the three
+		# signals libuv maps onto TerminateProcess.
+		try $proc.kill(Signal::SIGKILL);
+		await Promise.anyof($done, Promise.in(KILL-GRACE));
+	}
+
+	# Whatever the taps filed while the process was settling.  Skipped for a
+	# cancelled call: the request it would travel on has been abandoned.
+	self!flush($ctx, $pending-lock, %pending) if $streaming && !$cancelled;
+
+	my ($exit, $spawn-error) = exit-status($done);
+	with $spawn-error {
+		$err.add("\n") if $err.stats<bytes> > 0;
+		$err.add($_);
+	}
+
+	my %out = $out.snapshot;
+	my %err = $err.snapshot;
+
+	my %payload =
+		exit => $exit,
+		stdout => %out<text>,
+		stderr => %err<text>,
+		'timed-out' => $timed-out;
+
+	my %truncated = self!truncation(%out, %err);
+	%payload<truncated> = %truncated if %truncated.elems > 0;
+
+	to-json(%payload, :!pretty, :sorted-keys);
+}
+
+# === Notifications ===
+
+# Hand the caller everything the child has written since the last flush, in
+# batches, on the request's own channel.  Called only from the handler thread.
+method !flush($ctx, $pending-lock, %pending --> Nil) {
+	for <stdout stderr> -> $stream {
+		my Str $text = $pending-lock.protect: {
+			my $taken = %pending{$stream} // '';
+			%pending{$stream} = '';
+			$taken;
+		};
+
+		while $text.chars > 0 {
+			my ($batch, $rest) = split-at-bytes($text, NOTIFY-BATCH-BYTES);
+			$ctx.emit-notification(notification('notifications/message', {
+				level => 'info',
+				logger => $!run-logger,
+				data => { stream => $stream, text => $batch },
+			}));
+			$text = $rest;
+		}
+	}
+}
+
+# A background job's push channel.  MCP::Server.notify is era-aware and
+# echo-free; called from a flusher thread there is no request context, so it
+# takes the legacy path and delivers on an initialized legacy stdio session's
+# transport-wide channel.  A modern (Streamable HTTP) session has no
+# server-initiated stream between requests, so it answers False and nothing is
+# delivered — which is why "poll" and "output" exist and are documented as the
+# reliable way to follow a job.
+method !push(Str:D $level, Str:D $line --> Nil) {
+	my %notif = notification('notifications/message', {
+		level => $level, logger => $!job-logger, data => $line,
+	});
+	for @!servers -> $server {
+		try $server.notify(%notif);
+	}
+}
+
+# === Payload shaping ===
+
+# The "truncated" report, present only when something was actually dropped, so
+# a run that stayed inside its budget keeps the four-key payload it has always
+# had.  The counts are the ones in the markers embedded in the text: both come
+# out of the same locked read of the buffer.
+method !truncation(%out, %err --> Hash) {
+	my %report;
+	for (stdout => %out, stderr => %err) -> $pair {
+		my %snap = $pair.value;
+		next unless %snap<dropped-bytes> > 0 || %snap<dropped-lines> > 0;
+		%report{$pair.key} = {
+			bytes => %snap<dropped-bytes>,
+			lines => %snap<dropped-lines>,
+		};
+	}
+	%report;
+}
+
+# The cursor is opaque to the caller and deliberately so: it carries a position
+# in each of the two streams, and each position is a byte count and a line
+# count, because bytes alone cannot say how many lines a reader who fell behind
+# has missed.
+sub cursor-token(%out, %err --> Str:D) {
+	"{%out<cursor-bytes>}:{%out<cursor-lines>}:{%err<cursor-bytes>}:{%err<cursor-lines>}"
+}
+
+#| Decode the caller's cursor into (stdout bytes, stdout lines, stderr bytes,
+#| stderr lines).  An absent cursor reads from the beginning of both streams.
+method !cursor($raw --> List) {
+	return (0, 0, 0, 0) without $raw;
+
+	die "'cursor' must be a string, got a {$raw.^name}" unless $raw ~~ Str:D;
+	my $match = $raw ~~ / ^ (\d+) ':' (\d+) ':' (\d+) ':' (\d+) $ /;
+	die "'cursor' must be a value returned by a previous call to this tool, got '$raw'"
+		without $match;
+
+	$match.list.map(*.Int).List;
+}

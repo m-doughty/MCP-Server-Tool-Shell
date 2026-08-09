@@ -1,0 +1,264 @@
+use Test;
+use lib 't/lib';
+use ShellTest;
+use JSON::Fast;
+use MCP::Server;
+use MCP::Server::Tool::Shell;
+
+# The start / poll / output / kill quartet.  Everything here is about a command
+# that outlives the tool call which started it, so every wait is a wait-until
+# with a generous bound rather than a sleep of a guessed length.
+
+plan 11;
+
+my $raku = raku-path();
+
+sub shell-server(*%config --> MCP::Server:D) {
+	my $server = MCP::Server.new(:name<jobs>);
+	$server.plug: MCP::Server::Tool::Shell.new(allow => [$raku], |%config);
+	$server;
+}
+
+sub poll($server, Str:D $job --> Hash) {
+	from-json(text(call($server, 'sh_poll', { job => $job })));
+}
+
+sub finished($server, Str:D $job --> Bool:D) {
+	wait-until({ poll($server, $job)<state> ne 'running' });
+}
+
+subtest 'A job runs, finishes, and keeps its output' => {
+	plan 14;
+	my $server = shell-server;
+
+	my %start = json-ok($server, 'sh_start',
+		{ command => $raku, args => ['-e', 'print "out"; note "err"; exit 7'] },
+		'start',
+	);
+	ok %start<job> ~~ Str:D && %start<job>.chars > 0, 'A handle came back';
+	is %start<state>, 'running', 'and the job is running';
+	is-deeply %start.keys.sort.list, ('job', 'state'), 'start says nothing else';
+
+	ok finished($server, %start<job>), 'The job reached a terminal state';
+
+	my %done = poll($server, %start<job>);
+	is %done<state>, 'exited', 'It exited on its own';
+	is %done<exit>, 7, 'with its own status';
+	nok %done<killed>, 'nobody killed it';
+	nok %done<timed-out>, 'and it did not run out of time';
+	ok %done<started-at> ~~ Str:D, 'poll reports when it started';
+	ok %done<runtime> >= 0, 'and how long it took';
+	is %done<stdout-bytes>, 3, 'along with the byte totals';
+
+	my %out = json-ok($server, 'sh_output', { job => %start<job> }, 'output');
+	is-deeply
+		(%out<stdout>, %out<stderr>.trim, %out<state>, %out<eof>),
+		('out', 'err', 'exited', True),
+		'output returns both streams, the state and eof';
+};
+
+subtest 'Output can be followed with a cursor' => {
+	plan 8;
+	my $server = shell-server;
+	my $source = '$*OUT.out-buffer = 0; for ^4 { print "tick$_\n"; sleep 0.3 }';
+
+	my %start = json-ok($server, 'sh_start', { command => $raku, args => ['-e', $source] }, 'start');
+
+	# Read until the job is done, keeping every instalment.
+	my Str $seen = '';
+	my Str $cursor;
+	my Bool $eof = False;
+	my $deadline = now + 30;
+	while !$eof && now < $deadline {
+		my %chunk = from-json(text(call($server, 'sh_output',
+			{ job => %start<job>, |($cursor.defined ?? (cursor => $cursor) !! ()) })));
+		$seen ~= %chunk<stdout>;
+		$cursor = %chunk<cursor>;
+		$eof = so %chunk<eof>;
+		sleep 0.05 unless $eof;
+	}
+
+	ok $eof, 'The follow loop reached eof';
+	is $seen, (^4).map({ "tick$_\n" }).join, 'and saw every line exactly once';
+
+	my %spent = from-json(text(call($server, 'sh_output', { job => %start<job>, cursor => $cursor })));
+	is %spent<stdout>, '', 'A read past the end returns nothing';
+	ok %spent<eof>, 'and still says eof';
+	is %spent<cursor>, $cursor, 'with the cursor unmoved';
+	nok %spent<truncated>:exists, 'and no truncation report, because nothing was dropped';
+
+	errors-with $server, 'sh_output', { job => %start<job>, cursor => 'nonsense' },
+		'returned by a previous call', 'A made-up cursor is a caller error';
+};
+
+subtest 'A job can be killed, twice if you like' => {
+	plan 10;
+	my $server = shell-server;
+	my %start = json-ok($server, 'sh_start', { command => $raku, args => ['-e', 'sleep 300'] }, 'start');
+
+	is poll($server, %start<job>)<state>, 'running', 'It is running';
+
+	my %killed = json-ok($server, 'sh_kill', { job => %start<job> }, 'kill');
+	ok %killed<killed>, 'The kill was accepted';
+	is %killed<job>, %start<job>, 'for the job that was asked about';
+
+	ok finished($server, %start<job>), 'The job stopped';
+	my %after = poll($server, %start<job>);
+	is %after<state>, 'killed', 'and is reported as killed';
+	# On Windows the kill is TerminateProcess, which is not a signal, so the
+	# only portable claim is that the run did not succeed.
+	ok (%after<exit> // -1) != 0, 'with an unsuccessful exit status';
+
+	my %again = json-ok($server, 'sh_kill', { job => %start<job> }, 'kill again');
+	is-deeply (%again<state>, %again<killed>), ('killed', True),
+		'Killing a finished job is idempotent';
+};
+
+subtest 'A job kills itself when it is given a timeout' => {
+	plan 5;
+	my $server = shell-server;
+	my %start = json-ok($server, 'sh_start',
+		{ command => $raku, args => ['-e', 'sleep 300'], timeout => 0.5 },
+		'start with a budget',
+	);
+
+	ok finished($server, %start<job>), 'The job stopped on its own';
+	my %after = poll($server, %start<job>);
+	is %after<state>, 'killed', 'reported as killed';
+	ok %after<timed-out>, 'because it ran out of time';
+	ok (%after<exit> // -1) != 0, 'with an unsuccessful exit status';
+};
+
+subtest 'Only so many jobs may run at once' => {
+	plan 6;
+	my $server = shell-server(max-jobs => 1);
+	my %start = json-ok($server, 'sh_start', { command => $raku, args => ['-e', 'sleep 300'] }, 'start');
+
+	my %refused = call($server, 'sh_start', { command => $raku, args => ['-e', 'print 1'] });
+	ok errored(%refused), 'A second job is refused';
+	ok text(%refused).contains(%start<job>), 'and the message names the job in the way';
+
+	json-ok($server, 'sh_kill', { job => %start<job> }, 'kill');
+	ok finished($server, %start<job>), 'which frees the slot';
+
+	json-ok($server, 'sh_start', { command => $raku, args => ['-e', 'print 1'] },
+		'start once there is room');
+};
+
+subtest 'Finished jobs are remembered, but not forever' => {
+	plan 6;
+	my $server = shell-server(max-finished-jobs => 1);
+
+	my %first = json-ok($server, 'sh_start', { command => $raku, args => ['-e', 'print "one"'] }, 'first');
+	ok finished($server, %first<job>), 'The first job finished';
+
+	my %second = json-ok($server, 'sh_start', { command => $raku, args => ['-e', 'print "two"'] }, 'second');
+	ok finished($server, %second<job>), 'and so did the second';
+
+	errors-with $server, 'sh_poll', { job => %first<job> },
+		'Unknown job', 'The older job has been forgotten';
+	is poll($server, %second<job>)<state>, 'exited', 'The newer one is still there';
+};
+
+subtest 'A finished job ages out' => {
+	plan 4;
+	my $server = shell-server(job-ttl => 1);
+
+	my %job = json-ok($server, 'sh_start', { command => $raku, args => ['-e', 'print "brief"'] }, 'start');
+	ok finished($server, %job<job>), 'The job finished';
+
+	ok wait-until({ errored(call($server, 'sh_poll', { job => %job<job> })) }, timeout => 20),
+		'and is forgotten once its TTL has run out';
+
+	ok text(call($server, 'sh_poll', { job => %job<job> })).contains('seconds'),
+		'The refusal explains that finished jobs are only kept for a while';
+};
+
+subtest 'A job that outruns its buffers says so' => {
+	plan 8;
+	my $server = shell-server(max-output-bytes => 1024);
+	my $source = 'for ^200 { print sprintf("%03d ", $_) ~ "x" x 36 ~ "\n" }';
+
+	my %job = json-ok($server, 'sh_start', { command => $raku, args => ['-e', $source] }, 'start');
+	ok finished($server, %job<job>), 'The job finished';
+
+	is poll($server, %job<job>)<stdout-bytes>, 8200,
+		'poll reports everything the job produced, not just what was kept';
+
+	my %out = json-ok($server, 'sh_output', { job => %job<job> }, 'snapshot');
+	is %out<truncated><stdout><bytes>, 8200 - 1024, 'The snapshot says what it dropped';
+	ok %out<stdout>.contains("[... {8200 - 1024} bytes"), 'and marks the hole in the text';
+
+	# A cursor from the beginning of a stream that has since rolled: the read
+	# cannot deliver what was evicted, and says so rather than quietly skipping.
+	my %stale = json-ok($server, 'sh_output', { job => %job<job>, cursor => '0:0:0:0' }, 'stale cursor');
+	ok %stale<truncated><stdout><bytes> > 0, 'A stale cursor is told what it missed';
+};
+
+subtest 'Polling and reading a live job from several threads is safe' => {
+	plan 5;
+	my $server = shell-server;
+	my $source = '$*OUT.out-buffer = 0; for ^20 { print "row$_\n"; note "e$_"; sleep 0.05 }';
+	my %job = json-ok($server, 'sh_start', { command => $raku, args => ['-e', $source] }, 'start');
+
+	my @workers = (^4).map(-> $n {
+		start {
+			my Int $calls = 0;
+			my $until = now + 3;
+			while now < $until {
+				my $tool = $n %% 2 ?? 'sh_poll' !! 'sh_output';
+				my %response = call($server, $tool, { job => %job<job> });
+				die "error result from $tool: {text(%response)}" if errored(%response);
+				# Decoding is the assertion: a torn payload would not parse.
+				from-json(text(%response));
+				$calls++;
+			}
+			$calls;
+		}
+	});
+
+	my @counts = await Promise.allof(@workers).then({ @workers.map(*.result) })<>;
+	ok @counts.all > 0, 'Every worker got answers';
+	ok finished($server, %job<job>), 'and the job still finished';
+
+	my %out = json-ok($server, 'sh_output', { job => %job<job> }, 'final output');
+	is %out<stdout>, (^20).map({ "row$_\n" }).join, 'with its output intact';
+};
+
+subtest 'A job whose command cannot be spawned reports it, and frees its slot' => {
+	plan 6;
+	# Allowlisted, but not there: the allow list is a decision about what may
+	# be asked for, not a promise that it exists.
+	my $ghost = $*TMPDIR.add("mcp-shell-ghost-{$*PID}-{now.Int}").absolute;
+	my $server = MCP::Server.new(:name<ghost>);
+	$server.plug: MCP::Server::Tool::Shell.new(allow => [$ghost, $raku], max-jobs => 1);
+
+	my %job = json-ok($server, 'sh_start', { command => $ghost }, 'start a ghost');
+	ok finished($server, %job<job>), 'The job reached a terminal state';
+
+	my %after = poll($server, %job<job>);
+	is %after<exit>, -1, 'exit is -1 when the command could not be spawned';
+
+	my %out = json-ok($server, 'sh_output', { job => %job<job> }, 'output');
+	ok %out<stderr>.chars > 0, 'and the reason is on stderr';
+
+	json-ok($server, 'sh_start', { command => $raku, args => ['-e', 'print 1'] },
+		'The slot it never really occupied is free');
+};
+
+subtest 'Jobs nobody has heard of' => {
+	plan 4;
+	my $server = shell-server;
+
+	errors-with $server, 'sh_poll', { job => 'j99-nope' },
+		"Unknown job 'j99-nope'", 'An id that never existed is refused';
+	ok text(call($server, 'sh_output', { job => 'j99-nope' })).contains('forgotten'),
+		'and the refusal explains that finished jobs are eventually forgotten';
+
+	errors-with $server, 'sh_kill', {},
+		"'job' is required", 'A missing job argument is a caller error';
+	errors-with $server, 'sh_output', { job => '' },
+		"'job' is required", 'and so is an empty one';
+};
+
+done-testing;

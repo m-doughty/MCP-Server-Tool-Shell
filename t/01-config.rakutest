@@ -1,0 +1,218 @@
+use Test;
+use lib 't/lib';
+use ShellTest;
+use MCP::Server;
+use MCP::Server::Toolkit;
+use MCP::Server::Tool::Shell;
+
+plan 10;
+
+# The whole tool surface, as tools/list reports it.  Every subtest that checks
+# names checks all of them: a tool that quietly stops being registered is the
+# sort of thing a fixed tuple catches and a spot check does not.
+my constant TOOLS = <allowed kill output poll run start>;
+
+sub prefixed(Str:D $prefix --> List) {
+	$prefix eq '' ?? TOOLS.sort.list !! TOOLS.map({ "{$prefix}_$_" }).sort.list;
+}
+
+# A directory that certainly exists, and a path that certainly does not.
+my $here    = $*CWD.absolute;
+my $missing = $*TMPDIR.add("mcp-shell-missing-{$*PID}-{now.Int}").absolute;
+
+subtest 'from-config builds a configured toolkit' => {
+	plan 9;
+	my $kit = MCP::Server::Tool::Shell.from-config({
+		allow             => [raku-path(), 'git'],
+		cwd               => $here,
+		timeout           => 5,
+		'max-output-bytes' => 4096,
+		'max-output-lines' => 40,
+		'max-jobs'        => 2,
+		'max-finished-jobs' => 3,
+		'job-ttl'         => 30,
+	});
+	ok $kit ~~ MCP::Server::Toolkit, 'Instance does the Toolkit role';
+	is-deeply $kit.allow.List, (raku-path(), 'git'), 'Allow list passed through';
+	ok $kit.cwd ~~ IO::Path:D, 'Str cwd coerced to IO::Path';
+	is $kit.cwd.absolute, $here, 'Coerced cwd points where it was told to';
+	is $kit.timeout, 5, 'Timeout passed through';
+	is $kit.max-output-bytes, 4096, 'Byte cap passed through';
+	is $kit.max-output-lines, 40, 'Line cap passed through';
+	is $kit.max-jobs, 2, 'Job cap passed through';
+	is $kit.job-ttl, 30, 'Job TTL passed through';
+};
+
+subtest 'from-config key validation' => {
+	plan 4;
+	dies-with { MCP::Server::Tool::Shell.from-config({ allow => ['git'], allowed => True }) },
+		'Valid keys: allow, allow-any, cwd, job-ttl, max-finished-jobs, max-jobs, '
+		  ~ 'max-output-bytes, max-output-lines, timeout',
+		'Unknown key dies listing the valid keys';
+
+	dies-with { MCP::Server::Tool::Shell.from-config({ timeout => 5 }) },
+		'non-empty allow list', 'A config with no allow list and no allow-any dies';
+
+	dies-with { MCP::Server::Tool::Shell.from-config({ allow => ['git'], prefix => 'sh' }) },
+		"Config key 'prefix' is reserved", 'Reserved prefix key dies';
+
+	lives-ok { MCP::Server::Tool::Shell.from-config({ allow => ['git'] }) },
+		'Allow list alone is enough';
+};
+
+subtest 'Allow list validation' => {
+	plan 5;
+	dies-with { MCP::Server::Tool::Shell.from-config({ allow => [] }) },
+		'requires a non-empty allow list', 'Empty allow list dies (via from-config)';
+
+	dies-with { MCP::Server::Tool::Shell.new(allow => []) },
+		'requires a non-empty allow list', 'Empty allow list dies (via .new)';
+
+	dies-with { MCP::Server::Tool::Shell.new(allow => ['git', '']) },
+		'must be non-empty strings', 'Empty-string entry dies';
+
+	dies-with { MCP::Server::Tool::Shell.new(allow => ['git', 42]) },
+		'must be non-empty strings', 'Non-string entry dies';
+
+	is MCP::Server::Tool::Shell.new(allow => ['git']).timeout, 30,
+		'Timeout defaults to 30 seconds';
+};
+
+subtest 'allow and allow-any are exclusive' => {
+	plan 6;
+	dies-with { MCP::Server::Tool::Shell.new(allow => ['git'], allow-any => True) },
+		'mutually exclusive', 'Both gates at once dies (via .new)';
+
+	dies-with { MCP::Server::Tool::Shell.from-config({ allow => ['git'], 'allow-any' => True }) },
+		'mutually exclusive', 'Both gates at once dies (via from-config)';
+
+	dies-with { MCP::Server::Tool::Shell.new },
+		'non-empty allow list', 'Neither gate dies, and says how to opt out';
+
+	ok MCP::Server::Tool::Shell.new(:allow-any).allow-any,
+		'allow-any alone is a valid configuration';
+
+	is-deeply MCP::Server::Tool::Shell.new(:allow-any).allow.List, ().List,
+		'and leaves the allow list empty';
+
+	nok MCP::Server::Tool::Shell.new(allow => ['git']).allow-any,
+		'allow-any defaults to False';
+};
+
+subtest 'cwd validation' => {
+	plan 3;
+	dies-with { MCP::Server::Tool::Shell.new(allow => ['git'], cwd => $missing) },
+		'not an existing directory', 'Missing cwd dies';
+
+	my $file = $*TMPDIR.add("mcp-shell-file-{$*PID}-{now.Int}");
+	$file.spurt('not a directory');
+	LEAVE { $file.unlink if $file.e }
+	dies-with { MCP::Server::Tool::Shell.new(allow => ['git'], cwd => $file.absolute) },
+		'not an existing directory', 'A file is not an acceptable cwd';
+
+	is MCP::Server::Tool::Shell.new(allow => ['git']).cwd, IO::Path,
+		'cwd is undefined when unset';
+};
+
+subtest 'timeout validation' => {
+	plan 4;
+	dies-with { MCP::Server::Tool::Shell.new(allow => ['git'], timeout => 0) },
+		'timeout must be greater than zero', 'Zero timeout dies';
+
+	dies-with { MCP::Server::Tool::Shell.new(allow => ['git'], timeout => -1) },
+		'timeout must be greater than zero', 'Negative timeout dies';
+
+	is MCP::Server::Tool::Shell.new(allow => ['git'], timeout => 0.5).timeout, 0.5,
+		'Fractional timeouts are accepted';
+
+	is MCP::Server::Tool::Shell.from-config({ allow => ['git'], timeout => 1.5 }).timeout, 1.5,
+		'Fractional timeout survives from-config';
+};
+
+subtest 'Output cap validation' => {
+	plan 6;
+	is MCP::Server::Tool::Shell.new(allow => ['git']).max-output-bytes, 131072,
+		'Byte cap defaults to 128 KiB';
+	is MCP::Server::Tool::Shell.new(allow => ['git']).max-output-lines, 2000,
+		'Line cap defaults to 2000 lines';
+
+	dies-with { MCP::Server::Tool::Shell.new(allow => ['git'], max-output-bytes => 1023) },
+		'max-output-bytes must be at least 1024', 'A byte cap below the floor dies';
+
+	dies-with { MCP::Server::Tool::Shell.new(allow => ['git'], max-output-lines => 9) },
+		'max-output-lines must be at least 10', 'A line cap below the floor dies';
+
+	lives-ok { MCP::Server::Tool::Shell.new(allow => ['git'], max-output-bytes => 1024) },
+		'The byte floor itself is allowed';
+
+	lives-ok { MCP::Server::Tool::Shell.new(allow => ['git'], max-output-lines => 10) },
+		'The line floor itself is allowed';
+};
+
+subtest 'Job configuration validation' => {
+	plan 7;
+	my $kit = MCP::Server::Tool::Shell.new(allow => ['git']);
+	is $kit.max-jobs, 4, 'max-jobs defaults to 4';
+	is $kit.max-finished-jobs, 16, 'max-finished-jobs defaults to 16';
+	is $kit.job-ttl, 600, 'job-ttl defaults to ten minutes';
+
+	dies-with { MCP::Server::Tool::Shell.new(allow => ['git'], max-jobs => 0) },
+		'max-jobs must be at least one', 'A zero job cap dies';
+
+	dies-with { MCP::Server::Tool::Shell.new(allow => ['git'], max-finished-jobs => 0) },
+		'max-finished-jobs must be at least one', 'A zero retention cap dies';
+
+	dies-with { MCP::Server::Tool::Shell.new(allow => ['git'], job-ttl => 0) },
+		'job-ttl must be greater than zero', 'A zero TTL dies';
+
+	dies-with { MCP::Server::Tool::Shell.new(allow => ['git'], job-ttl => -5) },
+		'job-ttl must be greater than zero', 'A negative TTL dies';
+};
+
+subtest 'default-prefix' => {
+	plan 4;
+	is MCP::Server::Tool::Shell.default-prefix, 'sh', 'default-prefix is sh';
+
+	my $server = MCP::Server.new(:name<default>);
+	$server.plug: MCP::Server::Tool::Shell.new(allow => ['git']);
+	is-deeply tool-names($server), prefixed('sh'), 'Plug applies the sh prefix';
+
+	my $override = MCP::Server.new(:name<override>);
+	$override.plug: MCP::Server::Tool::Shell.new(allow => ['git']), :prefix<git>;
+	is-deeply tool-names($override), prefixed('git'), 'Explicit prefix wins';
+
+	my $bare = MCP::Server.new(:name<bare>);
+	$bare.plug: MCP::Server::Tool::Shell.new(allow => ['git']), :prefix('');
+	is-deeply tool-names($bare), prefixed(''), 'Empty prefix registers bare names';
+};
+
+subtest 'Tool schemas' => {
+	plan 12;
+	my $server = MCP::Server.new(:name<schema>);
+	$server.plug: MCP::Server::Tool::Shell.new(allow => ['git']);
+
+	my %run = tool-schema($server, 'sh_run');
+	is-deeply %run<required>.sort.list, ('command',), 'Only command is required on run';
+	is %run<properties><command><type>, 'string', 'command is a string';
+	is %run<properties><args><type>, 'array', 'args is an array';
+	is %run<properties><cwd><type>, 'string', 'cwd is a string';
+	is %run<properties><stdin><type>, 'string', 'stdin is a string';
+	is %run<properties><timeout><type>, 'number', 'timeout is a number';
+
+	my %start = tool-schema($server, 'sh_start');
+	is-deeply %start<properties>.keys.sort.list, <args command cwd stdin timeout>.list,
+		'start takes exactly the same arguments as run';
+	is-deeply %start<required>.sort.list, ('command',), 'Only command is required on start';
+
+	for <sh_poll sh_kill> -> $name {
+		my %schema = tool-schema($server, $name);
+		is-deeply %schema<properties>.keys.sort.list, ('job',), "$name takes only a job";
+	}
+
+	my %output = tool-schema($server, 'sh_output');
+	is-deeply %output<properties>.keys.sort.list, ('cursor', 'job'),
+		'output takes a job and an optional cursor';
+	is-deeply %output<required>.sort.list, ('job',), 'The cursor is optional';
+};
+
+done-testing;

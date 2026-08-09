@@ -1,0 +1,241 @@
+use Test;
+use lib 't/lib';
+use ShellTest;
+use JSON::Fast;
+use MCP::Server;
+use MCP::Server::Tool::Shell;
+
+plan 12;
+
+# Every command run here is the running Raku interpreter itself: it is the one
+# executable guaranteed to exist on macOS, Linux and Windows alike, and driving
+# it with -e keeps the tests free of platform-specific helper binaries.
+my $raku = raku-path();
+
+my $server = MCP::Server.new(:name<shell-tests>);
+$server.plug: MCP::Server::Tool::Shell.new(allow => [$raku]);
+
+subtest 'Standard output is captured' => {
+	plan 5;
+	my %got = run-ok($server, { command => $raku, args => ['-e', 'print "hi"'] }, 'stdout');
+	is %got<stdout>, 'hi', 'stdout captured verbatim';
+	is %got<stderr>, '', 'stderr empty';
+	is %got<exit>, 0, 'exit 0';
+	is %got<timed-out>, False, 'not timed out';
+};
+
+subtest 'Exit status is reported' => {
+	plan 4;
+	my %got = run-ok($server, { command => $raku, args => ['-e', 'exit 3'] }, 'exit');
+	is %got<exit>, 3, 'Non-zero exit code surfaces';
+	is %got<stdout>, '', 'No stdout';
+	is %got<timed-out>, False, 'not timed out';
+};
+
+subtest 'Standard error is captured separately' => {
+	plan 4;
+	my %got = run-ok($server,
+		{ command => $raku, args => ['-e', 'note "warn"; print "ok"'] },
+		'stderr',
+	);
+	is %got<stdout>, 'ok', 'stdout kept clean';
+	is %got<stderr>.trim, 'warn', 'stderr captured';
+	is %got<exit>, 0, 'exit 0 even with stderr output';
+};
+
+subtest 'Arguments are an argv vector, not a command line' => {
+	plan 6;
+	# If any shell were involved, "two words" would arrive as two arguments (or
+	# with the quotes attached).  Round-tripping it proves there is none.
+	my %got = run-ok($server,
+		{ command => $raku, args => ['-e', 'print @*ARGS[0]', 'two words'] },
+		'spacey arg',
+	);
+	is %got<stdout>, 'two words', 'Argument containing a space stays one argument';
+
+	my %all = run-ok($server,
+		{ command => $raku, args => ['-e', 'print @*ARGS.elems', 'a b', 'c'] },
+		'arg count',
+	);
+	is %all<stdout>, '2', 'Argument count is exactly what was passed';
+
+	# Shell metacharacters are just bytes in an argv entry.
+	my %meta = run-ok($server,
+		{ command => $raku, args => ['-e', 'print @*ARGS[0]', '$HOME; rm -rf / && echo *'] },
+		'metacharacters',
+	);
+	is %meta<stdout>, '$HOME; rm -rf / && echo *',
+		'Shell metacharacters are passed through untouched';
+};
+
+subtest 'Working directory' => {
+	plan 4;
+	my $dir = $*TMPDIR.add("mcp-shell-cwd-{$*PID}-{now.Int}");
+	$dir.mkdir;
+	LEAVE { $dir.rmdir if $dir.d }
+
+	my %override = run-ok($server,
+		{ command => $raku, args => ['-e', 'print $*CWD.Str'], cwd => $dir.absolute },
+		'cwd override',
+	);
+	is %override<stdout>.IO.resolve.absolute, $dir.resolve.absolute,
+		'Run happens in the requested directory';
+
+	# A configured default applies when the caller says nothing.
+	my $defaulted = MCP::Server.new(:name<cwd-default>);
+	$defaulted.plug: MCP::Server::Tool::Shell.new(allow => [$raku], cwd => $dir.absolute);
+	my %response = $defaulted.handle-request({
+		jsonrpc => '2.0', id => 1, method => 'tools/call',
+		params => {
+			name => 'sh_run',
+			arguments => { command => $raku, args => ['-e', 'print $*CWD.Str'] },
+		},
+	});
+	my %got = from-json(%response<result><content>[0]<text>);
+	is %got<stdout>.IO.resolve.absolute, $dir.resolve.absolute,
+		'Configured default cwd is used';
+
+	my %missing = call($server, 'sh_run', {
+		command => $raku,
+		args    => ['-e', 'print 1'],
+		cwd     => $dir.add('nope').absolute,
+	});
+	ok %missing<result><isError> && text(%missing).contains('Working directory does not exist'),
+		'A missing cwd is a caller error';
+};
+
+subtest 'Commands outside the allow list are refused' => {
+	plan 4;
+	my %response = call($server, 'sh_run', { command => 'rm', args => ['-rf', '/'] });
+	ok %response<result><isError>, 'Disallowed command is an error result';
+	ok text(%response).contains("Command 'rm' is not allowlisted"), 'Message names the command';
+	ok text(%response).contains($raku), 'Message lists the allow list';
+
+	# Matching is on the exact string: a basename of an allowlisted absolute
+	# path is still not allowlisted.
+	my %basename = call($server, 'sh_run', { command => $*EXECUTABLE.basename });
+	ok %basename<result><isError>, 'Basename of an allowlisted path is not allowlisted';
+};
+
+subtest 'An allowlisted but missing binary is a runtime condition' => {
+	plan 3;
+	my $ghost = $*TMPDIR.add("mcp-shell-ghost-{$*PID}-{now.Int}").absolute;
+	my $ghosted = MCP::Server.new(:name<ghost>);
+	$ghosted.plug: MCP::Server::Tool::Shell.new(allow => [$ghost]);
+
+	my %response = $ghosted.handle-request({
+		jsonrpc => '2.0', id => 1, method => 'tools/call',
+		params => { name => 'sh_run', arguments => { command => $ghost } },
+	});
+	nok %response<result><isError>, 'Reported in the payload, not as an error result';
+
+	my %got = from-json(%response<result><content>[0]<text>);
+	is %got<exit>, -1, 'exit is -1 when the command could not be spawned';
+	ok %got<stderr>.chars > 0, 'The spawn failure is explained on stderr';
+};
+
+subtest 'Argument validation' => {
+	plan 6;
+	my @bad =
+		({ command => $raku, args => 'not-an-array' }, 'must be an array of strings'),
+		({ command => $raku, args => [{ nested => 1 },] }, 'entries must be strings'),
+		({ command => $raku, args => ["nul\0byte"] }, 'must not contain NUL bytes'),
+		({ command => '' }, "'command' is required"),
+		({}, "'command' is required"),
+		({ command => $raku, args => ['-e', 'print 1'], cwd => '' }, "'cwd' must be a non-empty string"),
+	;
+	for @bad -> ($arguments, $needle) {
+		my %response = call($server, 'sh_run', $arguments);
+		my $matched = %response<result><isError> && text(%response).contains($needle);
+		ok $matched, "Rejected: $needle";
+		diag "got: {text(%response)}" unless $matched;
+	}
+};
+
+subtest 'The allowed tool lists the allow list' => {
+	plan 3;
+	is text(call($server, 'sh_allowed', {})), $raku, 'Single-entry allow list';
+
+	my $many = MCP::Server.new(:name<many>);
+	$many.plug: MCP::Server::Tool::Shell.new(allow => ['rg', 'git', $raku]);
+	my %response = $many.handle-request({
+		jsonrpc => '2.0', id => 1, method => 'tools/call',
+		params => { name => 'sh_allowed', arguments => {} },
+	});
+	my @lines = %response<result><content>[0]<text>.lines;
+	is-deeply @lines.List, ($raku, 'git', 'rg').sort.list, 'Sorted, one per line';
+	nok %response<result><isError>, 'Not an error result';
+};
+
+subtest 'A per-call timeout overrides the configured one' => {
+	plan 10;
+	# The toolkit's own budget is the 30s default, so a call that comes back in
+	# under a second can only have used the argument.
+	my $started = now;
+	my %got = run-ok($server,
+		{ command => $raku, args => ['-e', 'sleep 60'], timeout => 0.5 },
+		'short timeout',
+	);
+	my $elapsed = now - $started;
+	ok %got<timed-out>, 'The per-call budget was applied';
+	ok $elapsed < 20, "And bounded the wall clock ({$elapsed.round(0.01)}s)";
+
+	my %quick = run-ok($server,
+		{ command => $raku, args => ['-e', 'print "fast"'], timeout => 30 },
+		'long timeout',
+	);
+	is %quick<stdout>, 'fast', 'A longer budget does not slow anything down';
+	nok %quick<timed-out>, 'and does not flag a run that finished';
+
+	my @bad =
+		({ timeout => 'soon' }, "'timeout' must be a number of seconds"),
+		({ timeout => True }, "'timeout' must be a number of seconds"),
+		({ timeout => 0 }, "'timeout' must be greater than zero"),
+		({ timeout => -1 }, "'timeout' must be greater than zero"),
+	;
+	for @bad -> ($extra, $needle) {
+		errors-with(
+			$server, 'sh_run',
+			{ command => $raku, args => ['-e', 'print 1'], |$extra },
+			$needle, "Rejected: {$extra<timeout>.raku} — $needle",
+		);
+	}
+};
+
+subtest 'A payload that fits its budget says nothing about truncation' => {
+	plan 4;
+	my %got = run-ok($server,
+		{ command => $raku, args => ['-e', 'print "small"'] },
+		'tiny output',
+	);
+	is-deeply %got.keys.sort.list, ('exit', 'stderr', 'stdout', 'timed-out'),
+		'Exactly the four keys a run has always had';
+	nok %got<truncated>:exists, 'No truncated key when nothing was dropped';
+	nok %got<stdout>.contains('dropped'), 'And no marker in the output';
+};
+
+subtest 'allow-any runs anything, and says so' => {
+	plan 6;
+	my $any = MCP::Server.new(:name<anything>);
+	$any.plug: MCP::Server::Tool::Shell.new(:allow-any);
+
+	my %got = run-ok($any,
+		{ command => $raku, args => ['-e', 'print "unlisted"'] },
+		'unlisted command',
+	);
+	is %got<stdout>, 'unlisted', 'A command nobody allowlisted still runs';
+
+	is text(call($any, 'sh_allowed', {})),
+		'Any command may be run: this toolkit has no allow list.',
+		'The allowed tool is honest about it';
+
+	# The argument checks that are not about the allow list stay in force.
+	errors-with $any, 'sh_run', { command => '' },
+		"'command' is required", 'An empty command is still refused';
+	errors-with $any, 'sh_run', { command => "raku\0evil" },
+		'must not contain NUL bytes', 'A NUL in the command is still refused';
+	errors-with $any, 'sh_run', { command => $raku, args => ["nul\0byte"] },
+		'must not contain NUL bytes', 'A NUL in an argument is still refused';
+};
+
+done-testing;

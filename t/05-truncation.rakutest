@@ -1,0 +1,192 @@
+use Test;
+use lib 't/lib';
+use ShellTest;
+use MCP::Server;
+use MCP::Server::Tool::Shell;
+use MCP::Server::Tool::Shell::Buffer;
+
+# Two halves: the buffer on its own, where every boundary can be hit exactly,
+# and the buffer through the run tool, where the process decides how the output
+# arrives in chunks and the answer has to come out the same anyway.
+
+plan 8;
+
+my $raku = raku-path();
+
+sub buffer(Int:D :$bytes, Int:D :$lines = 2000 --> MCP::Server::Tool::Shell::Buffer:D) {
+	MCP::Server::Tool::Shell::Buffer.new(max-bytes => $bytes, max-lines => $lines);
+}
+
+subtest 'A stream inside its budget is kept verbatim' => {
+	plan 7;
+	my $buf = buffer(bytes => 1024);
+	$buf.add("one\n");
+	$buf.add("two\n");
+	$buf.add('three');
+
+	my %snap = $buf.snapshot;
+	is %snap<text>, "one\ntwo\nthree", 'Every chunk, in order, untouched';
+	is %snap<bytes>, 13, 'Byte total counts what was written';
+	is %snap<lines>, 2, 'Line total counts the newlines';
+	is %snap<dropped-bytes>, 0, 'Nothing dropped';
+	is %snap<dropped-lines>, 0, 'No lines dropped either';
+	nok %snap<text>.contains('dropped'), 'And no marker anywhere in the text';
+	is %snap<cursor-bytes>, 13, 'The cursor is the end of the stream';
+};
+
+subtest 'The byte budget keeps a head and a rolling tail' => {
+	plan 7;
+	# 40 bytes: 10 for the head (a quarter), 30 for the tail.
+	my $buf = buffer(bytes => 40);
+	$buf.add('.' x 10);        # exactly fills the head
+	$buf.add('x' x 100);
+	$buf.add('y' x 20);
+
+	my %snap = $buf.snapshot;
+	is %snap<bytes>, 130, 'The total is everything that was written';
+
+	my ($head, $tail) = %snap<text>.split(/\n '[... ' \d+ ' bytes / ' \d+ ' lines dropped ...]' \n/);
+	is $head, "." x 10, 'The head is the first bytes of the stream';
+	is $tail.chars, 30, 'The tail is the last bytes of the stream';
+	is $tail, ('x' x 10) ~ ('y' x 20), 'and is contiguous with the end';
+
+	is %snap<dropped-bytes>, 90, 'What is missing is reported';
+	ok %snap<text>.contains('[... 90 bytes / 0 lines dropped ...]'),
+		'The marker says the same thing the report does';
+
+	$buf.add('z' x 5);
+	is $buf.snapshot<dropped-bytes>, 95, 'The tail keeps rolling as more arrives';
+};
+
+subtest 'The line budget is enforced as well as the byte one' => {
+	plan 5;
+	# 12 lines: 3 for the head, 9 for the tail.
+	my $buf = buffer(bytes => 8192, lines => 12);
+	$buf.add("line$_\n") for ^40;
+
+	my %snap = $buf.snapshot;
+	my @lines = %snap<text>.lines;
+	is @lines[0], 'line0', 'The head starts at the beginning';
+	is @lines[2], 'line2', 'and holds its share of the lines';
+	is @lines[*-1], 'line39', 'The tail ends at the end';
+	is %snap<dropped-lines>, 40 - 12, 'The dropped line count is exact';
+	ok %snap<text>.contains("/ {40 - 12} lines dropped"),
+		'and the marker agrees with it';
+};
+
+subtest 'Byte cuts land on character boundaries' => {
+	plan 5;
+	# Three-byte characters against budgets that do not divide by three.
+	my $buf = buffer(bytes => 20);   # head 5 bytes, tail 15
+	$buf.add('あいうえおかきくけこ');   # 10 characters, 30 bytes
+
+	my %snap = $buf.snapshot;
+	is %snap<bytes>, 30, 'Bytes are counted as UTF-8, not as characters';
+
+	my $marker = %snap<text> ~~ / '[... ' \d+ ' bytes / ' \d+ ' lines dropped ...]' /;
+	ok $marker.defined, 'Something was dropped';
+
+	my ($head, $tail) = %snap<text>.split(/\n '[... ' \d+ ' bytes / ' \d+ ' lines dropped ...]' \n/);
+	is $head, 'あ', 'The head holds whole characters only (5 bytes fits one)';
+	is $tail, 'かきくけこ', 'and so does the tail (15 bytes fits five)';
+	ok %snap<text>.encode('utf-8').decode('utf-8') eq %snap<text>,
+		'The rendering is valid text end to end';
+};
+
+subtest 'Cursor reads pick up where the last one stopped' => {
+	plan 8;
+	my $buf = buffer(bytes => 4096);
+	$buf.add("first\n");
+
+	my %one = $buf.read-from(0, 0);
+	is %one<text>, "first\n", 'A read from the start gets everything';
+	is %one<cursor-bytes>, 6, 'and hands back the position after it';
+	is %one<cursor-lines>, 1, 'lines included';
+
+	my %none = $buf.read-from(%one<cursor-bytes>, %one<cursor-lines>);
+	is %none<text>, '', 'A read at the end gets nothing';
+	is %none<dropped-bytes>, 0, 'and reports no gap';
+
+	$buf.add("second\n");
+	$buf.add("third\n");
+	my %rest = $buf.read-from(%one<cursor-bytes>, %one<cursor-lines>);
+	is %rest<text>, "second\nthird\n", 'Only what arrived since';
+	is %rest<dropped-bytes>, 0, 'with nothing missed';
+
+	is $buf.snapshot<text>, "first\nsecond\nthird\n",
+		'and the snapshot still shows the lot';
+};
+
+subtest 'A cursor that fell behind is told what it missed' => {
+	plan 6;
+	my $buf = buffer(bytes => 40);
+	$buf.add("aaaa\n");                   # 5 bytes: fills the head budget of 10
+
+	my %early = $buf.read-from(0, 0);
+	is %early<text>, "aaaa\n", 'The first read got the first line';
+
+	# Far more than the tail budget, so the position the reader is holding is
+	# evicted while it is not looking.
+	$buf.add("filler$_\n") for ^20;
+
+	my %late = $buf.read-from(%early<cursor-bytes>, %early<cursor-lines>);
+	ok %late<dropped-bytes> > 0, 'The read reports a gap';
+	ok %late<dropped-lines> > 0, 'in lines as well as bytes';
+	ok %late<text>.contains(
+		"\n[... {%late<dropped-bytes>} bytes / {%late<dropped-lines>} lines dropped ...]\n"
+	), 'and marks it in the text with the same counts';
+	ok %late<text>.ends-with("filler19\n"), 'What survived is the end of the stream';
+
+	my %caught-up = $buf.read-from(%late<cursor-bytes>, %late<cursor-lines>);
+	is %caught-up<dropped-bytes>, 0, 'A cursor that is up to date misses nothing';
+};
+
+subtest 'The run tool reports what it dropped' => {
+	plan 10;
+	my $server = MCP::Server.new(:name<truncating>);
+	# The floor: 1024 bytes, so 256 for the head and 768 for the tail.
+	$server.plug: MCP::Server::Tool::Shell.new(
+		allow => [$raku], max-output-bytes => 1024,
+	);
+
+	# 200 lines of exactly 41 bytes each, generated the same way on both sides.
+	my $source = 'for ^200 { print sprintf("%03d ", $_) ~ "x" x 36 ~ "\n" }';
+	my $full = (^200).map({ sprintf("%03d ", $_) ~ ('x' x 36) ~ "\n" }).join;
+	is $full.chars, 8200, 'The fixture is the size the test thinks it is';
+
+	my %got = run-ok($server, { command => $raku, args => ['-e', $source] }, 'big output');
+	is %got<exit>, 0, 'The command itself was fine';
+	ok %got<truncated>:exists, 'The payload admits to dropping something';
+	is %got<truncated><stdout><bytes>, 8200 - 1024, 'Byte count is exact';
+	is %got<truncated><stdout><lines>, 200 - 25, 'Line count is exact';
+	nok %got<truncated><stderr>:exists, 'A stream that dropped nothing is not listed';
+
+	my $marker = "\n[... {8200 - 1024} bytes / {200 - 25} lines dropped ...]\n";
+	is %got<stdout>, $full.substr(0, 256) ~ $marker ~ $full.substr(*- 768),
+		'The rendering is the first 256 bytes, the marker, and the last 768';
+
+	# Chunk sizes are the operating system's business, so the same command has
+	# to come back the same way twice.
+	my %again = run-ok($server, { command => $raku, args => ['-e', $source] }, 'again');
+	is %again<stdout>, %got<stdout>, 'Truncation does not depend on how output arrived';
+};
+
+subtest 'Both streams are capped, independently' => {
+	plan 6;
+	my $server = MCP::Server.new(:name<two-streams>);
+	$server.plug: MCP::Server::Tool::Shell.new(
+		allow => [$raku], max-output-bytes => 1024, max-output-lines => 10,
+	);
+
+	my $source = 'print "out$_\n" for ^100; note "err$_" for ^100';
+	my %got = run-ok($server, { command => $raku, args => ['-e', $source] }, 'both streams');
+
+	is %got<stdout>.lines.elems, 10 + 2, 'stdout keeps its ten lines plus the marker';
+	is %got<stderr>.lines.elems, 10 + 2, 'and so does stderr';
+	is %got<truncated><stdout><lines>, 90, 'Each stream reports its own losses';
+	is %got<truncated><stderr><lines>, 90, 'independently of the other';
+	ok %got<stdout>.starts-with("out0\n") && %got<stdout>.ends-with("out99\n"),
+		'Head and tail are the ends of the stream';
+};
+
+done-testing;

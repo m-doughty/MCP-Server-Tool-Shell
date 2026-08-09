@@ -1,0 +1,88 @@
+use Test;
+use JSON::Fast;
+# NB: MCP::Server::Tool::Shell is deliberately NOT `use`d here.  This file is the
+# regression guard for the loader path a real deployment takes — raku-mcp and
+# MCP::Server.new(:tools[...]) pull the pack in with `require` at runtime, and
+# `use`ing it here would hide any breakage in that path.
+use MCP::Server;
+use MCP::Server::Toolkit;
+
+plan 4;
+
+my $raku = $*EXECUTABLE.absolute;
+
+# The full tool surface, so a tool that stops being registered by the loader
+# path is caught here as well as in t/01.
+my constant TOOLS = <allowed kill output poll run start>;
+
+sub prefixed(Str:D $prefix --> List) {
+	TOOLS.map({ "{$prefix}_$_" }).sort.list;
+}
+
+sub tool-names($server) {
+	$server.handle-request({
+		jsonrpc => '2.0', id => 99, method => 'tools/list',
+	})<result><tools>.map(*<name>).sort.list;
+}
+
+subtest 'Bare name resolves under MCP::Server::Tool::' => {
+	plan 2;
+	my $server = MCP::Server.new(
+		:name<t>,
+		:tools['Shell' => { allow => [$raku], prefix => 'x' }],
+	);
+	is-deeply tool-names($server), prefixed('x'), 'Toolkit loaded under its prefix';
+
+	my %response = $server.handle-request({
+		jsonrpc => '2.0', id => 1, method => 'tools/call',
+		params => {
+			name => 'x_run',
+			arguments => { command => $raku, args => ['-e', 'print "loaded"'] },
+		},
+	});
+	is from-json(%response<result><content>[0]<text>)<stdout>, 'loaded',
+		'Runtime-loaded tool executes';
+};
+
+subtest 'Qualified name is used verbatim' => {
+	plan 1;
+	my $server = MCP::Server.new(
+		:name<t>,
+		:tools['MCP::Server::Tool::Shell' => { allow => [$raku] }],
+	);
+	is-deeply tool-names($server), prefixed('sh'),
+		'Fully qualified name loads and keeps the default prefix';
+};
+
+subtest 'The required type object does the Toolkit role' => {
+	plan 2;
+	# The return value of require MUST be bound: a bare ::('...') lookup
+	# afterwards can resolve to an absent GLOBAL slot once MCP::Server has been
+	# `use`d from the same process.
+	my \type = (require ::('MCP::Server::Tool::Shell'));
+	ok type ~~ MCP::Server::Toolkit, 'Loaded type does MCP::Server::Toolkit';
+	is type.default-prefix, 'sh', 'Loaded type reports its default prefix';
+};
+
+subtest 'Config errors survive the loader' => {
+	plan 2;
+	my Str $msg;
+	{
+		MCP::Server.new(:name<t>, :tools['Shell' => { allow => [] }]);
+		CATCH { default { $msg = .message } }
+	}
+	ok $msg.defined && $msg.contains('non-empty allow list'),
+		'An empty allow list still dies when loaded by name';
+	diag "message was: {$msg // '(nothing thrown)'}"
+		unless $msg.defined && $msg.contains('non-empty allow list');
+
+	my Str $unknown;
+	{
+		MCP::Server.new(:name<t>, :tools['Shell' => { allow => ['git'], timeut => 5 }]);
+		CATCH { default { $unknown = .message } }
+	}
+	ok $unknown.defined && $unknown.contains('Unknown config key(s)'),
+		'A typo in the config still dies when loaded by name';
+};
+
+done-testing;

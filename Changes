@@ -1,0 +1,57 @@
+Revision history for MCP::Server::Tool::Shell
+
+{{$NEXT}}
+
+0.2.0  2026-08-09T20:02:19+01:00
+    - Background jobs: new "start", "poll", "output" and "kill" tools run a
+      command that outlives the tool call which started it.  Jobs are capped
+      (max-jobs, default 4), remembered after they finish (max-finished-jobs,
+      default 16) and eventually forgotten (job-ttl, default 600s); "output"
+      takes an opaque cursor for incremental reads, or none at all for a
+      capped snapshot of the whole run.
+    - Output is now bounded.  Each stream of each run keeps a head and a
+      rolling tail (max-output-bytes, default 128 KiB; max-output-lines,
+      default 2000) with a "[... N bytes / M lines dropped ...]" marker where
+      the middle went and a "truncated" key reporting the same counts.  A run
+      that stays inside its budget is byte-for-byte what it always was, and
+      its payload still has exactly the four keys it always had.
+    - Standard input: "run" and "start" take an optional "stdin" string, fed
+      to the command and then closed.  Omitting it leaves standard input
+      unconnected, exactly as before; an empty string is an immediate EOF.
+      The write is detached, so a command that never reads cannot stall the
+      server.
+    - Live progress: a 2026-07-28 request that opted into logging (_meta
+      logLevel) gets the command's output as notifications/message while it
+      runs, batched at 32 KiB and flushed from the handler thread.  Background
+      jobs push through MCP::Server.notify instead, which reaches a legacy
+      stdio session's transport-wide channel; on Streamable HTTP there is no
+      server-initiated stream between requests, so "poll" and "output" are the
+      reliable way to follow a job there.
+    - "run" takes an optional per-call "timeout" that overrides the server
+      default; "start" takes an optional one with no default.
+    - A cancelled request (a caller that hung up) now kills the command and
+      unwinds instead of running to the end of its budget: the run loop wakes
+      at least every 0.25s to flush, check the deadline and check for
+      cancellation.  Jobs deliberately do not observe cancellation.
+    - New "allow-any" configuration key for deployments that gate consent
+      elsewhere (an MCP::Client::Policy in front of the tools, say).  It is
+      mutually exclusive with "allow", and one of the two is required.
+    - New MCP::Server::Tool::Shell::Buffer (capped capture buffer with cursor
+      reads) and MCP::Server::Tool::Shell::Jobs (Job + Registry), both
+      documented and usable on their own.
+    - Requires MCP::Server 0.4.0 or newer, for MCP::Server.notify.
+
+0.1.0  2026-07-29T00:00:00+01:00
+    - Initial release
+    - MCP::Server::Toolkit pack providing an allowlisted command runner:
+      "run" executes one of the exact command strings in the allow list and
+      returns JSON with exit, stdout, stderr and timed-out; "allowed" lists
+      the allow list.
+    - Commands are spawned via Proc::Async as an argv vector, never through a
+      shell, so no quoting, globbing, redirection or interpolation happens.
+    - Configurable allow list (required), default working directory and
+      per-run timeout, all validated at construction time.
+    - Runs are killed with SIGKILL once the timeout expires and reported with
+      timed-out: true; unspawnable commands report exit -1 with the reason on
+      stderr instead of failing the call.
+    - Default prefix "sh", so tools register as sh_run and sh_allowed.

@@ -1,0 +1,103 @@
+use Test;
+use lib 't/lib';
+use ShellTest;
+use JSON::Fast;
+use MCP::Server;
+use MCP::Server::Tool::Shell;
+
+# A caller who hangs up mid-run — an HTTP client closing its response stream —
+# leaves the handler holding a process nobody is waiting for.  The run loop
+# notices, kills the command and unwinds; the answer it produces is a dead
+# letter that nobody reads.  Every bound below is generous on purpose: the
+# claim is "it stopped long before the command would have", not "it stopped
+# after exactly N seconds".
+
+plan 4;
+
+my $raku = raku-path();
+
+my $server = MCP::Server.new(:name<cancel>);
+# A budget far longer than any bound asserted here, so nothing below can pass
+# because of the timeout instead of the cancellation.
+$server.plug: MCP::Server::Tool::Shell.new(allow => [$raku], timeout => 600);
+
+subtest 'A caller who has already gone gets a short run' => {
+	plan 4;
+	my $gone = Promise.new;
+	$gone.keep(True);
+
+	my $started = now;
+	my %response = modern-call($server, 'sh_run',
+		{ command => $raku, args => ['-e', 'sleep 300'] },
+		log-level => 'info', cancelled => $gone,
+	);
+	my $elapsed = now - $started;
+
+	ok $elapsed < 30, "The run gave up quickly ({$elapsed.round(0.01)}s)";
+	nok %response<result><isError>, 'Cancellation is not an error result';
+
+	my %payload = from-json(%response<result><content>[0]<text>);
+	nok %payload<timed-out>,
+		'and is not dressed up as a timeout — the budget was never reached';
+	is-deeply %payload.keys.sort.list, ('exit', 'stderr', 'stdout', 'timed-out'),
+		'The dead letter has the shape every other run has';
+};
+
+subtest 'A caller who leaves halfway through is noticed' => {
+	plan 3;
+	my $started = now;
+	my %response = modern-call($server, 'sh_run',
+		{ command => $raku, args => ['-e', '$*OUT.out-buffer = 0; print "before"; sleep 300'] },
+		log-level => 'info', cancelled => Promise.in(1),
+	);
+	my $elapsed = now - $started;
+
+	ok $elapsed >= 1, 'The run carried on until the caller actually left';
+	ok $elapsed < 30, "and stopped soon after ({$elapsed.round(0.01)}s)";
+	nok %response<result><isError>, 'Still not an error result';
+};
+
+subtest 'A run nobody cancelled is not cut short' => {
+	plan 3;
+	my $started = now;
+	my %response = modern-call($server, 'sh_run',
+		{ command => $raku, args => ['-e', 'sleep 1; print "finished"'] },
+		log-level => 'info', cancelled => Promise.new,
+	);
+	my $elapsed = now - $started;
+
+	my %payload = from-json(%response<result><content>[0]<text>);
+	is %payload<stdout>, 'finished', 'The command ran to completion';
+	nok %payload<timed-out>, 'inside its budget';
+	ok $elapsed >= 1, 'and the loop waited for it';
+};
+
+subtest 'A background job outlives the request that started it' => {
+	plan 5;
+	# Jobs deliberately do not watch the cancellation flag: the request that
+	# started one is answered the moment the handle is minted, and its stream
+	# closing afterwards is the normal course of events rather than a signal.
+	my $gone = Promise.new;
+	$gone.keep(True);
+
+	my %response = modern-call($server, 'sh_start',
+		{ command => $raku, args => ['-e', 'sleep 1; print "still here"'] },
+		cancelled => $gone,
+	);
+	nok %response<result><isError>, 'The job started';
+
+	my %start = from-json(%response<result><content>[0]<text>);
+	is %start<state>, 'running', 'and is running';
+
+	ok wait-until({
+		from-json(text(call($server, 'sh_poll', { job => %start<job> })))<state> ne 'running'
+	}), 'It finished on its own time';
+
+	my %done = from-json(text(call($server, 'sh_poll', { job => %start<job> })));
+	is %done<state>, 'exited', 'nobody killed it for the request that walked away';
+
+	my %out = from-json(text(call($server, 'sh_output', { job => %start<job> })));
+	is %out<stdout>, 'still here', 'and its output survived';
+};
+
+done-testing;

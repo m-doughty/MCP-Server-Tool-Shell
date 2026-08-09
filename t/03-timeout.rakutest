@@ -1,0 +1,60 @@
+use Test;
+use JSON::Fast;
+use MCP::Server;
+use MCP::Server::Tool::Shell;
+
+plan 3;
+
+# The interpreter under test is the only binary these tests need; `sleep` inside
+# -e keeps the hang portable (no sleep(1) binary, no shell).
+my $raku = $*EXECUTABLE.absolute;
+
+my $server = MCP::Server.new(:name<timeout>);
+$server.plug: MCP::Server::Tool::Shell.new(allow => [$raku], timeout => 2);
+
+sub run(@args) {
+	$server.handle-request({
+		jsonrpc => '2.0', id => 1, method => 'tools/call',
+		params => { name => 'sh_run', arguments => { command => $raku, args => @args } },
+	});
+}
+
+subtest 'A hung command is killed and reported' => {
+	plan 4;
+	my $started = now;
+	my %response = run(['-e', 'sleep 60']);
+	my $elapsed = now - $started;
+
+	nok %response<result><isError>, 'A timeout is a payload condition, not an error result';
+
+	my %got = from-json(%response<result><content>[0]<text>);
+	ok %got<timed-out>, 'timed-out is true';
+	isnt %got<exit>, 0, 'The run does not report success';
+
+	# The configured budget is 2s; the kill grace period allows a few more.
+	# Anything near 60s would mean the timeout never fired at all.
+	ok $elapsed < 15, "Wall clock stayed bounded ({$elapsed.round(0.01)}s)";
+};
+
+subtest 'Output produced before the kill is kept' => {
+	plan 3;
+	my %response = run(['-e', 'print "partial"; $*OUT.flush; note "noise"; sleep 60']);
+	my %got = from-json(%response<result><content>[0]<text>);
+	ok %got<timed-out>, 'timed-out is true';
+	is %got<stdout>, 'partial', 'stdout written before the kill survives';
+	is %got<stderr>.trim, 'noise', 'stderr written before the kill survives';
+};
+
+subtest 'A command inside its budget is not flagged' => {
+	plan 3;
+	my $started = now;
+	my %response = run(['-e', 'print "quick"']);
+	my $elapsed = now - $started;
+
+	my %got = from-json(%response<result><content>[0]<text>);
+	nok %got<timed-out>, 'timed-out is false';
+	is %got<exit>, 0, 'Normal exit status';
+	ok $elapsed < 2, "Returns as soon as the command exits ({$elapsed.round(0.01)}s)";
+};
+
+done-testing;

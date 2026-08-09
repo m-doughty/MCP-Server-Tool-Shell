@@ -1,0 +1,117 @@
+use Test;
+use lib 't/lib';
+use ShellTest;
+use JSON::Fast;
+use MCP::Server;
+use MCP::Server::Tool::Shell;
+
+# Standard input is the one thing here that can hang a server: a child that
+# never reads it, a child that exits before it is written, a payload bigger than
+# the pipe buffer.  Every fixture below is one of those.
+
+plan 7;
+
+my $raku = raku-path();
+
+my $server = MCP::Server.new(:name<stdin-tests>);
+$server.plug: MCP::Server::Tool::Shell.new(allow => [$raku], timeout => 30);
+
+# Reports what it managed to read, giving up after a couple of seconds so a
+# stdin that is never closed cannot hang the test run.
+my constant PEEK = 'my $p = start { my $t = ""; try { $t = $*IN.slurp }; $t }; '
+	~ 'await Promise.anyof($p, Promise.in(2)); '
+	~ 'print "[" ~ ($p.status ~~ Kept ?? ($p.result // "") !! "") ~ "]"';
+
+subtest 'Text on standard input reaches the command' => {
+	plan 4;
+	my %got = run-ok($server,
+		{ command => $raku, args => ['-e', 'print $*IN.slurp.uc'], stdin => "hello\nworld\n" },
+		'round trip',
+	);
+	is %got<stdout>, "HELLO\nWORLD\n", 'The command read exactly what was sent';
+	is %got<exit>, 0, 'and exited cleanly';
+	nok %got<timed-out>, 'without running out of time';
+};
+
+subtest 'An empty string is an immediate end of file' => {
+	plan 5;
+	my $started = now;
+	my %got = run-ok($server,
+		{ command => $raku, args => ['-e', 'print "[" ~ $*IN.slurp ~ "]"'], stdin => '' },
+		'empty stdin',
+	);
+	my $elapsed = now - $started;
+	is %got<stdout>, '[]', 'The command saw end of file, not a blocked pipe';
+	is %got<exit>, 0, 'and exited cleanly';
+	nok %got<timed-out>, 'without running out of time';
+	ok $elapsed < 20, "and did not wait around ({$elapsed.round(0.01)}s)";
+};
+
+subtest 'Omitting stdin leaves it unconnected' => {
+	plan 5;
+	# The distinction that matters: a command we were not asked to write to is
+	# not written to, and does not receive an end of file we invented for it.
+	my %sent = run-ok($server,
+		{ command => $raku, args => ['-e', PEEK], stdin => 'ping' },
+		'with stdin',
+	);
+	is %sent<stdout>, '[ping]', 'What was sent is what arrived';
+
+	my %absent = run-ok($server,
+		{ command => $raku, args => ['-e', PEEK] },
+		'without stdin',
+	);
+	is %absent<stdout>, '[]', 'A command started without stdin gets nothing from us';
+	nok %absent<timed-out>, 'and the run is not held up by it';
+};
+
+subtest 'A command that never reads its input does not stall the server' => {
+	plan 4;
+	# A megabyte is far more than any pipe buffer, so a writer that was not
+	# detached would block here until the run timed out.
+	my $started = now;
+	my %got = run-ok($server,
+		{ command => $raku, args => ['-e', 'print "done"'], stdin => 'x' x 1_000_000 },
+		'unread stdin',
+	);
+	my $elapsed = now - $started;
+	is %got<stdout>, 'done', 'The command ran and answered';
+	nok %got<timed-out>, 'The run was not killed for taking too long';
+	ok $elapsed < 25, "and came back promptly ({$elapsed.round(0.01)}s)";
+};
+
+subtest 'NUL bytes are fine on standard input' => {
+	plan 2;
+	# Unlike argv, where a NUL would truncate the argument at the exec
+	# boundary, stdin is a byte stream and a program may want any byte in it.
+	my %got = run-ok($server,
+		{ command => $raku, args => ['-e', 'print $*IN.slurp.ords.join(",")'], stdin => "a\0b" },
+		'NUL bytes',
+	);
+	is %got<stdout>, '97,0,98', 'Every byte arrived, NUL included';
+};
+
+subtest 'stdin must be a string' => {
+	plan 2;
+	errors-with $server, 'sh_run', { command => $raku, stdin => 42 },
+		"'stdin' must be a string", 'A number is refused';
+	errors-with $server, 'sh_run', { command => $raku, stdin => ['a', 'b'] },
+		"'stdin' must be a string", 'An array is refused';
+};
+
+subtest 'Background jobs take stdin too' => {
+	plan 5;
+	my %start = json-ok($server, 'sh_start',
+		{ command => $raku, args => ['-e', 'print $*IN.slurp.flip'], stdin => 'stressed' },
+		'start with stdin',
+	);
+	ok %start<job>.chars > 0, 'A job handle came back';
+
+	ok wait-until({ from-json(text(call($server, 'sh_poll', { job => %start<job> })))<state> ne 'running' }),
+		'The job finished';
+
+	my %out = json-ok($server, 'sh_output', { job => %start<job> }, 'output');
+	is %out<stdout>, 'desserts', 'The job read its standard input';
+};
+
+done-testing;

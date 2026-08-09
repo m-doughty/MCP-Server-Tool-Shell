@@ -1,0 +1,38 @@
+# NB: this workflow stays red until MCP::Server 0.3.0 — the release that ships
+# the MCP::Server::Toolkit role this pack is written against — is published to
+# the Raku ecosystem.  Until then "zef install --deps-only ." resolves the
+# ecosystem's 0.2.0, which has no Toolkit role, and every test file fails to
+# compile.  Local runs work with: prove6 -Ilib -I../MCP-Server/lib t/
+name: test
+
+on:
+  push:
+    branches:
+      - '*'
+    tags-ignore:
+      - '*'
+  pull_request:
+
+jobs:
+  raku:
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest
+          - macos-latest
+          - windows-latest
+        raku-version:
+          - 'latest'
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: Raku/setup-raku@v1
+        with:
+          raku-version: ${{ matrix.raku-version }}
+      - name: Install Dependencies
+        run: zef install --/test --test-depends --deps-only .
+      - name: Install App::Prove6
+        run: zef install --/test App::Prove6
+      - name: Run Tests
+        run: prove6 -I. t
