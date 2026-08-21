@@ -1,0 +1,55 @@
+use v6.d;
+use Test;
+use MCP::Server::Tool::Shell::Jobs;
+use MCP::Server::Tool::Shell::Isolation;
+
+plan 4;
+
+# The Windows branch of kill-process-tree once passed a bare {} -- an empty
+# Hash composer, not a Block -- as tap's &emit Callable, so every kill on
+# Windows died with a type-check error instead of killing the tree: the job
+# stayed "running", its slot was never freed, and a timeout came back as an
+# error result (caught by Windows CI, invisible on POSIX where the branch
+# never runs).  Run the branch on every platform by faking $*DISTRO for the
+# duration of the kill: on a platform without taskkill the tree kill is
+# fire-and-forget and fails quietly, and the unconditional direct kill still
+# settles the child, so the assertions below hold everywhere.
+
+my class FakeWinDistro {
+	method is-win { True }
+}
+
+my $proc = Proc::Async.new($*EXECUTABLE.absolute, '-e', 'sleep 600');
+$proc.stdout.tap(-> $ {});
+$proc.stderr.tap(-> $ {});
+my $done = $proc.start;
+LEAVE try $proc.kill(Signal::SIGKILL);
+
+# Wait for the pid promise to be kept, so the taskkill branch really runs
+# rather than short-circuiting on an unknown pid.
+my $deadline = now + 30;
+until process-pid($proc).defined or now > $deadline { sleep 0.05 }
+ok process-pid($proc).defined, 'the child reported a pid';
+
+my $survived = False;
+{
+	CATCH { default { diag "kill-process-tree threw: $_" } }
+	my $*DISTRO = FakeWinDistro.new;
+	kill-process-tree($proc);
+	$survived = True;
+}
+ok $survived, 'kill-process-tree survives the Windows branch on every platform';
+
+await Promise.anyof($done, Promise.in(30));
+ok $done.status !~~ Planned, 'the child was killed';
+
+# Collect the exit status without sinking it: a signal-killed child keeps the
+# start promise with a Proc that throws when sunk.  Guarded on settlement so
+# a regression (child not killed) fails the plan instead of hanging the file
+# on an await that can never return.
+my $ = try await $done unless $done.status ~~ Planned;
+
+lives-ok {
+	my $*DISTRO = FakeWinDistro.new;
+	kill-process-tree($proc);
+}, 'a second tree kill of a dead child is harmless';

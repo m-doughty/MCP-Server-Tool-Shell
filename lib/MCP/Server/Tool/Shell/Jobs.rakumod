@@ -184,8 +184,10 @@ sub kill-process-tree($proc, Bool:D :$group = False --> Nil) is export {
 			# handler thread on a "kill" tool call, or the foreground loop on a
 			# timeout).  Its own output is discarded.
 			my $tk = Proc::Async.new('taskkill', '/T', '/F', '/PID', .Str);
-			$tk.stdout.tap({}, quit => -> $ {});
-			$tk.stderr.tap({}, quit => -> $ {});
+			# -> $ {}, not {}: a bare {} in argument position is an empty
+			# Hash, and tap's first positional is the &emit Callable.
+			$tk.stdout.tap(-> $ {}, quit => -> $ {});
+			$tk.stderr.tap(-> $ {}, quit => -> $ {});
 			try $tk.start;
 		}
 	}

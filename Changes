@@ -2,6 +2,16 @@ Revision history for MCP::Server::Tool::Shell
 
 {{$NEXT}}
 
+0.4.1  2026-08-21T22:04:14+01:00
+    - Fix every kill on Windows dying with "expected Callable but got Hash":
+      the taskkill branch of kill-process-tree tapped the reaper's output with
+      a bare {} — an empty Hash composer, not a Block — so the type check
+      failed before anything was signalled. A killed job stayed "running",
+      its slot was never freed, and a foreground timeout came back as an
+      error result instead of a timeout payload (caught by Windows CI; POSIX
+      never runs the branch). The new regression test fakes $*DISTRO so the
+      Windows branch runs on every platform.
+
 0.4.0  2026-08-21T21:42:28+01:00
     - The three introspection tools (allowed, poll, output) now declare the MCP
       annotations readOnlyHint and idempotentHint: none of them starts, stops
