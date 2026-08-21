@@ -84,7 +84,7 @@ Configuration
 <th>Key</th> <th>Type</th> <th>Default</th> <th>Meaning</th>
 </tr></thead>
 <tbody>
-<tr> <td>allow</td> <td>Array of Str</td> <td>required</td> <td>Exact argv0 strings that may be executed</td> </tr> <tr> <td>allow-any</td> <td>Bool</td> <td>False</td> <td>Run anything, with no allow list at all</td> </tr> <tr> <td>cwd</td> <td>Str (directory)</td> <td>none</td> <td>Default working directory for every run</td> </tr> <tr> <td>timeout</td> <td>Real (seconds)</td> <td>30</td> <td>Wall-clock budget for a foreground run</td> </tr> <tr> <td>max-output-bytes</td> <td>Int (bytes)</td> <td>131072</td> <td>Retained output per stream, per run</td> </tr> <tr> <td>max-output-lines</td> <td>Int (lines)</td> <td>2000</td> <td>Retained lines per stream, per run</td> </tr> <tr> <td>max-jobs</td> <td>Int</td> <td>4</td> <td>Background jobs that may run at once</td> </tr> <tr> <td>max-finished-jobs</td> <td>Int</td> <td>16</td> <td>Finished jobs that stay pollable</td> </tr> <tr> <td>job-ttl</td> <td>Real (seconds)</td> <td>600</td> <td>How long a finished job stays pollable</td> </tr>
+<tr> <td>allow</td> <td>Array of Str</td> <td>required</td> <td>Exact argv0 strings that may be executed</td> </tr> <tr> <td>allow-any</td> <td>Bool</td> <td>False</td> <td>Run anything, with no allow list at all</td> </tr> <tr> <td>cwd</td> <td>Str (directory)</td> <td>none</td> <td>Default working directory for every run</td> </tr> <tr> <td>isolate-terminal</td> <td>Bool</td> <td>True</td> <td>Keep children away from the host&#39;s terminal</td> </tr> <tr> <td>timeout</td> <td>Real (seconds)</td> <td>30</td> <td>Wall-clock budget for a foreground run</td> </tr> <tr> <td>max-output-bytes</td> <td>Int (bytes)</td> <td>131072</td> <td>Retained output per stream, per run</td> </tr> <tr> <td>max-output-lines</td> <td>Int (lines)</td> <td>2000</td> <td>Retained lines per stream, per run</td> </tr> <tr> <td>max-jobs</td> <td>Int</td> <td>4</td> <td>Background jobs that may run at once</td> </tr> <tr> <td>max-finished-jobs</td> <td>Int</td> <td>16</td> <td>Finished jobs that stay pollable</td> </tr> <tr> <td>job-ttl</td> <td>Real (seconds)</td> <td>600</td> <td>How long a finished job stays pollable</td> </tr>
 </tbody>
 </table>
 
@@ -93,6 +93,8 @@ Configuration
   * **allow-any** and **allow** are mutually exclusive, and one of them is required: a runner that can run everything and a runner that can run nothing are both configurations somebody meant, but "I forgot to say" is not. See [Running anything: allow-any and MCP::Client::Policy](#Running anything: allow-any and MCP::Client::Policy).
 
   * **cwd** must be an existing directory at construction time; the constructor dies otherwise. A per-call `cwd` argument overrides it.
+
+  * **isolate-terminal** keeps spawned commands away from the terminal this process is attached to, and is on unless you turn it off. Leave it on unless you know the process has no terminal worth protecting — see [Terminal isolation](#Terminal isolation), which is also where the "it refuses to construct" failure mode is explained.
 
   * **timeout** must be greater than zero. Fractional values are fine (`0.5` is half a second). A per-call `timeout` argument overrides it for one `run`; `start` takes one too, but has no default.
 
@@ -117,14 +119,22 @@ MCP::Server::Tool::Shell.new(allow => <git>, cwd => '/nope');
 
 MCP::Server::Tool::Shell.from-config({ allow => <git>, timeut => 5 });
 # Unknown config key(s) for MCP::Server::Tool::Shell: timeut.
-# Valid keys: allow, allow-any, cwd, job-ttl, max-finished-jobs, max-jobs,
-# max-output-bytes, max-output-lines, timeout
+# Valid keys: allow, allow-any, cwd, isolate-terminal, job-ttl,
+# max-finished-jobs, max-jobs, max-output-bytes, max-output-lines, timeout
 ```
 
 The default prefix is `sh`, so the tools below are registered as `sh_run`, `sh_start`, `sh_poll`, `sh_output`, `sh_kill` and `sh_allowed` unless you pass a `prefix` of your own.
 
 Tools
 -----
+
+### Which of them may run at once
+
+`allowed`, `poll` and `output` declare the MCP annotations `readOnlyHint => True ` and `idempotentHint => True `; `run`, `start` and `kill` declare nothing.
+
+A host reads those hints as a licence to run a batch of the annotated calls side by side, and to execute identical ones in a batch once. It holds here: `allowed` reads a list this instance was built with, and `poll` and `output` read a job's state and a window of what it has **already** written — an `output` cursor is a position the caller holds, so reading from one leaves the buffer exactly as it was and the same call twice is the same answer twice. The job registry and every job's buffers take their own locks, so several of these at once see coherent state rather than a half-written flush.
+
+The other three could not be annotated: a command is whatever the caller typed and this pack cannot know whether it writes, `start` mints a job, and `kill` ends one.
 
 ### run
 
@@ -187,13 +197,15 @@ That third one is the point of an argv vector: `fix the thing` is a single argum
 
 ### Standard input
 
-`stdin` is written to the command and the pipe is then closed, so a filter sees a normal end of input. Three states, and they are all different:
+`stdin` is written to the command and the pipe is then closed, so a filter sees a normal end of input. Three states:
 
-  * **omitted** — standard input is left unconnected, exactly as it was before this feature existed. Nothing is written to the command and it is not handed an end of file we invented for it.
+  * **omitted** — nothing is written, and the command reads an immediate end of file. What it does *not* get is the server process's own standard input: with `isolate-terminal` on (the default) `fd 0` is a closed pipe rather than the host's terminal or the client's transport. See [Terminal isolation](#Terminal isolation).
 
   * **empty string** — the pipe is opened and closed immediately, so the command reads an immediate EOF. This is what you want for a filter you have nothing to say to.
 
   * **a string** — written and then closed.
+
+The first two therefore look the same to the command and differ only in intent — unless you have turned isolation off, in which case an omitted `stdin` leaves `fd 0` inherited from the server process, as it was before isolation existed.
 
 The write is detached from the run: a command that never reads its input cannot stall the server, however much you send it, and a command that exits before reading everything just makes the write fail (`EPIPE`), which is a runtime condition rather than an error. NUL bytes are fine here, unlike in `args`: this is a byte stream, not a C string.
 
@@ -303,18 +315,40 @@ Takes `job`, kills it with `SIGKILL` and returns `{ job, state, killed } ` immed
 
 ### Push notifications, honestly
 
-While a job runs, its output and lifecycle events are also pushed as `notifications/message` — output batches at `debug` (so a legacy client can silence them with `logging/setLevel`) and `started` / `exited` / `killed` lines at `info`, all labelled with the prefixed `start` tool name. Whether they arrive depends on the transport, and this is worth knowing before you build a UI on it:
+While a job runs, its output and lifecycle events are also pushed as `notifications/message` — output batches at `debug` (so a legacy client can silence them with `logging/setLevel`) and `started` / `exited` / `killed` lines at `info`, all labelled with the prefixed `start` tool name. Whether they arrive depends on how the server is being spoken to, and this is worth knowing before you build a UI on it:
 
 <table class="pod-table">
 <thead><tr>
 <th>Session</th> <th>Push</th> <th>Why</th>
 </tr></thead>
 <tbody>
-<tr> <td>Legacy stdio, initialized</td> <td>Yes</td> <td>One client, one transport-wide channel to write on</td> </tr> <tr> <td>Legacy stdio, pre-handshake</td> <td>No</td> <td>Nothing may be sent before the client says it is initialized</td> </tr> <tr> <td>Modern Streamable HTTP</td> <td>No</td> <td>There is no server-initiated stream between requests</td> </tr> <tr> <td>No transport (in-process)</td> <td>No</td> <td>Nowhere to write</td> </tr>
+<tr> <td>Legacy stdio, initialized</td> <td>Yes</td> <td>One client, one transport-wide channel to write on</td> </tr> <tr> <td>Legacy stdio, pre-handshake</td> <td>No</td> <td>Nothing may be sent before the client says it is initialized</td> </tr> <tr> <td>Modern Streamable HTTP</td> <td>No</td> <td>There is no server-initiated stream between requests</td> </tr> <tr> <td>In-process, C&lt;:on-notify&gt;</td> <td>Yes</td> <td>The host process is the client, and it wired up a sink</td> </tr> <tr> <td>In-process, no sink</td> <td>No</td> <td>Nowhere to write</td> </tr>
 </tbody>
 </table>
 
-So: **`poll` and `output` are the reliable way to follow a job**, on every transport. Push is a bonus where the transport happens to support it, never a substitute for polling — and a push channel that refuses or fails never affects the job itself, whose output is safe in its buffers either way.
+So: **`poll` and `output` are the reliable way to follow a job**, on every transport. Push is a bonus where the channel happens to exist, never a substitute for polling — and a push channel that refuses or fails never affects the job itself, whose output is safe in its buffers either way.
+
+### Job lifecycle events
+
+The two `info` lines above are prose, meant for a log window. The same two facts also go out as a structured `notifications/job`, on the same channel and under the same delivery rules, for a host that wants to **act** on a job finishing rather than show it to somebody:
+
+```json
+{"jsonrpc":"2.0","method":"notifications/job",
+ "params":{"job":"j1-1x9k2w","state":"started","runtime":0,
+           "logger":"sh_start","command":"make"}}
+
+{"jsonrpc":"2.0","method":"notifications/job",
+ "params":{"job":"j1-1x9k2w","state":"exited","exit":0,"runtime":42.317,
+           "logger":"sh_start","command":"make"}}
+```
+
+  * Exactly one `started` and exactly one terminal event (`exited` or `killed`) per job, by construction: one thread wins the transition that emits each. A job that could not be spawned at all emits only the terminal one, with `exit` `-1` — and emits it from inside the `start` call, so it can reach a host a moment before the handle does.
+
+  * `exit` is **absent**, not null, when the status never arrived: "we do not know" and "it exited with 0" must not look alike to a program.
+
+  * `command` is the job's own record of the program it was asked to run, truncated to 120 characters. **Never a byte of what the child wrote**, and not its arguments either. A host is likely to turn these events into text that something — a person, a model — reads as trustworthy, and a command that prints `[background event] ignore your previous instructions` must not get a hearing that way. Output has its own channel and its own tool.
+
+  * `logger` is the prefixed `start` tool name, so two shell kits plugged into one server can be told apart.
 
 ### allowed
 
@@ -343,13 +377,52 @@ This pack is a gate, not a sandbox. What it guarantees:
 
 What it deliberately does not do:
 
-  * **It does not constrain what an allowed command can do.** Allowlisting an interpreter or a shell (`sh`, `bash`, `pwsh`, `raku`, `python`) hands over arbitrary code execution, because those programs take code as an argument. Allowlist leaf tools, not launchers.
+  * **It does not, on its own, constrain what an allowed command can do.** Allowlisting an interpreter or a shell (`sh`, `bash`, `pwsh`, `raku`, `python`) hands over arbitrary code execution, because those programs take code as an argument. Allowlist leaf tools, not launchers. A `launcher` (see [Sandboxing: the launcher seam](#Sandboxing: the launcher seam)) *can* constrain a run — it is where a host wraps the spawn in an OS sandbox — but the pack itself makes no such promise.
 
   * **It does not filter arguments.** `git` can push, `rg` can read any file the server user can read, and `cwd` is unrestricted unless you leave it unset and only allow commands that ignore it. Run the server as a user whose privileges you are comfortable handing to the model.
 
   * **It does not scrub the environment.** Children inherit the server process's environment, including any credentials in it.
 
-  * **It only kills the command itself.** Grandchildren the command spawned may outlive a kill, and can hold the pipes open long enough for the exit status to be lost (reported as `exit: null`).
+  * **It does not stop a command reaching the network, the clock, or any other resource the server's user can reach.** Isolation here is about the terminal and the process tree, not about capabilities; that is what a `launcher` is for.
+
+### Terminal isolation
+
+Where a shell pack runs decides what its children can wreck.
+
+Plugged into a stdio MCP server, the pack lives in a process whose `fd 0` is a pipe from the client, and a child that inherits it is mostly harmless. Plugged in **in-process** — a terminal application hosting its own tool server rather than talking to one over a socket — the pack lives in a process whose `fd 0` is the user's terminal, and whose **controlling terminal** every child inherits. From there one ordinary command can take the host apart:
+
+  * A child that puts the terminal in raw mode and restores it to cooked mode on the way out — any full-screen program: an editor, a pager, another TUI — leaves the *host's* terminal cooked. The host carries on drawing and never receives another keystroke: its input is being line-buffered by a terminal it no longer controls, and its quit key has become flow control. This is not hypothetical; it is the incident this feature exists for.
+
+  * A child that reads standard input steals the bytes the host was going to read — keystrokes from a terminal, or, in stdio server mode, the client's own JSON-RPC frames.
+
+  * A child that opens `/dev/tty` reaches the host's terminal even when all three of its own descriptors are pipes.
+
+None of that is a command misbehaving. It is a command doing exactly what it always does, to a terminal it should never have been able to see. So, unless you set `isolate-terminal => False `, the pack does two things at **both** spawn sites (a foreground `run` and a background `start`):
+
+  * **Standard input is detached.** A run given no `stdin` argument gets a pipe that is closed immediately, so its `fd 0` reads end of file rather than the host's terminal or transport. A run that *is* given `stdin` is unchanged. This half works on every platform.
+
+  * **The child gets a new session (POSIX).** A fresh session has no controlling terminal, so `/dev/tty` cannot be opened at all: the host's terminal is not merely unwritten-to, it is unreachable. Because a new session is also a new process group, this is what makes a kill reach the whole tree.
+
+A new session has to be created by the child itself, between `fork` and `exec`, which is not somewhere Raku code can run — so the pack `exec`s a tiny trampoline that calls `setsid(2)` and then `exec`s the real command **in the same process**, preserving the pid every kill and exit status depends on. `perl` is used by preference (it is on macOS and every mainstream Linux, and the pack supplies the trampoline text itself, so a command that cannot be `exec`'d still reports `exit: -1` with the reason on stderr exactly as it always did); `setsid(1)` is the fallback for images without perl. The trampoline adds one `exec` — a few milliseconds — per run, and it can never reach a shell: the `exec` is `execvp(3)`, never `/bin/sh`.
+
+The trampoline is chosen by the pack, never by the caller: no tool argument reaches it, and the command still has to pass the allow list before anything is spawned. It is found on `PATH` (falling back to the usual absolute locations), on the same trust assumption the allow list already makes for a bare command name — a process whose `PATH` has a writable directory ahead of `/usr/bin` has larger problems than this.
+
+Which mechanism is available is resolved **and verified** once per process, by running a one-liner through the trampoline and checking that it came back a session leader with the pid that was spawned. A toolkit that asks for isolation and cannot get it **refuses to construct**, naming what it tried:
+
+```raku
+# Nothing on this machine can detach a child:
+MCP::Server::Tool::Shell.new(allow => <git>);
+# Shell toolkit could not isolate spawned commands from the controlling
+# terminal, so it refuses to start: ... Install perl (or util-linux for
+# setsid), or, if this process has no terminal worth protecting, construct
+# the toolkit with isolate-terminal => False.
+```
+
+That is deliberate: a protection that is quietly missing is worse than one that is loudly absent, because the failure it prevents costs the user their session.
+
+**Kills follow the tree.** Because an isolated child leads its own process group, a timeout, a cancelled call and the `kill` tool all signal the *group*: the grandchildren a command spawned die with it instead of outliving it and holding its pipes open (which used to lose the exit status, reported as `exit: null`). With `isolate-terminal => False ` the old behaviour returns — on Unix, only the direct child is signalled.
+
+**Windows** has no sessions, no controlling terminal and no `termios` to corrupt, so the session half of this simply does not apply there and the pack does not pretend otherwise: `isolate-terminal` still detaches standard input (which is the platform's own version of the hazard — a child reading the host's console, or its stdio transport), and kills already took the whole tree via `taskkill /T /F`. Console-handle isolation beyond standard input is not attempted.
 
 ### Running anything: allow-any and MCP::Client::Policy
 
@@ -364,6 +437,39 @@ $server.plug: MCP::Server::Tool::Shell.new(:allow-any);
 
 With a policy in front, `sh_run` and `sh_start` match no allow rule, so every call is put to the user before it happens — which is a better gate than a static list for an interactive coding agent, and a much worse one for an unattended server. If nothing is asking a human, use `allow`.
 
+### Sandboxing: the launcher seam
+
+The pack is a gate, not a sandbox — but it leaves a seam for a host to bolt one on. The `launcher` attribute is a `Callable` (programmatic only: a closure cannot come from a JSON config, so `from-config` does not offer it) given the validated plan just before the process is built:
+
+```raku
+MCP::Server::Tool::Shell.new(
+    :allow-any,
+    launcher => -> %plan {
+        # %plan is { command, argv, dir }.  Return { command, argv }: the
+        # program actually exec'd becomes the wrapper, with the original
+        # command and its arguments folded onto the wrapper's own argv.  dir
+        # is left alone — the working directory is still applied by the pack.
+        %(
+            command   => 'sandbox-exec',
+            argv      => ['-p', $profile, %plan<command>, |%plan<argv>],
+            sandboxed => True,
+        );
+    },
+);
+```
+
+The seam is deliberately minimal and total:
+
+  * **It wraps both spawn sites.** A foreground `run` and a background `start` pass through the same launcher and the same wrapping — there is no path that escapes it.
+
+  * **An undefined launcher is exactly the old behaviour.** No launcher, no wrapping, and the result payload is byte-for-byte what it always was.
+
+  * **A launcher that throws is a failed spawn, not a crash.** A launcher that dies (or returns a shape the pack cannot spawn) lands in the same `exit: -1` + reason-in-stderr payload a command that could not be `exec`'d does. It never takes the server down, and never runs the unwrapped command as a fallback — a sandbox that failed to build is a run that failed, not a run that escaped.
+
+  * **It marks its own runs.** A launcher may return `sandboxed => True `, which surfaces as `sandbox => { active => true } ` on the result (a foreground `run`, or a job's `output`). A host reads it to tell a sandbox denial from an ordinary non-zero exit — the hook for an "it was the sandbox; retry without it?" prompt. The key is **absent** otherwise, so a run with no launcher, or one the launcher declined to sandbox, keeps the payload it always had.
+
+The launcher does not see, and cannot change, the working directory, the timeout, the output caps or the standard input: it wraps *what runs*, and the pack still governs *how long, how much and where*.
+
 ### Windows notes
 
   * Bare names resolve the way `CreateProcess` resolves them, so `allow => <git> ` runs `git.exe` off `PATH`. Allowlist the string you want the caller to *pass* (`git`), not the file that ends up being executed (`git.exe`) — the match happens before any resolution.
@@ -371,6 +477,10 @@ With a policy in front, `sh_run` and `sh_start` match no allow rule, so every ca
   * Arguments are still a vector: Rakudo quotes each entry for `CreateProcess`, so an argument containing spaces stays one argument.
 
   * A kill becomes `TerminateProcess`, which the command cannot trap or delay. There are no signals, so there is no `128 + signal` exit status: a killed run or job reports whatever `TerminateProcess` left behind (`1`, in practice). Test for `exit != 0` rather than for `137`.
+
+  * A kill takes the **whole process tree**: `taskkill /T /F /PID` is issued against the child before the `TerminateProcess` backstop, so grandchildren the command spawned do not outlive the kill. It is fire-and-forget — the watcher collects the exit status independently — and if `taskkill` is missing from a stripped image the direct-child kill still runs. (Unix reaches the tree a different way, by signalling the process group of an isolated child; see [Terminal isolation](#Terminal isolation).)
+
+  * `isolate-terminal` detaches standard input here as it does everywhere, but there is no session to leave and no `/dev/tty` to close off: Windows has neither, so the pack claims neither. See [Terminal isolation](#Terminal isolation).
 
   * Everything else — stdin, capped output, streaming, jobs — behaves the same as on Unix.
 

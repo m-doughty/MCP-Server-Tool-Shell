@@ -91,6 +91,7 @@ Key               | Type            | Default  | Meaning
 allow             | Array of Str    | required | Exact argv0 strings that may be executed
 allow-any         | Bool            | False    | Run anything, with no allow list at all
 cwd               | Str (directory) | none     | Default working directory for every run
+isolate-terminal  | Bool            | True     | Keep children away from the host's terminal
 timeout           | Real (seconds)  | 30       | Wall-clock budget for a foreground run
 max-output-bytes  | Int (bytes)     | 131072   | Retained output per stream, per run
 max-output-lines  | Int (lines)     | 2000     | Retained lines per stream, per run
@@ -109,6 +110,12 @@ L<#Running anything: allow-any and MCP::Client::Policy>.
 
 =item B<cwd> must be an existing directory at construction time; the constructor
 dies otherwise. A per-call C<cwd> argument overrides it.
+
+=item B<isolate-terminal> keeps spawned commands away from the terminal this
+process is attached to, and is on unless you turn it off. Leave it on unless
+you know the process has no terminal worth protecting — see
+L<#Terminal isolation>, which is also where the "it refuses to construct"
+failure mode is explained.
 
 =item B<timeout> must be greater than zero. Fractional values are fine
 (C<0.5> is half a second). A per-call C<timeout> argument overrides it for one
@@ -140,8 +147,8 @@ MCP::Server::Tool::Shell.new(allow => <git>, cwd => '/nope');
 
 MCP::Server::Tool::Shell.from-config({ allow => <git>, timeut => 5 });
 # Unknown config key(s) for MCP::Server::Tool::Shell: timeut.
-# Valid keys: allow, allow-any, cwd, job-ttl, max-finished-jobs, max-jobs,
-# max-output-bytes, max-output-lines, timeout
+# Valid keys: allow, allow-any, cwd, isolate-terminal, job-ttl,
+# max-finished-jobs, max-jobs, max-output-bytes, max-output-lines, timeout
 =end code
 
 The default prefix is C<sh>, so the tools below are registered as C<sh_run>,
@@ -149,6 +156,25 @@ C<sh_start>, C<sh_poll>, C<sh_output>, C<sh_kill> and C<sh_allowed> unless you
 pass a C<prefix> of your own.
 
 =head2 Tools
+
+=head3 Which of them may run at once
+
+C<allowed>, C<poll> and C<output> declare the MCP annotations
+C<< readOnlyHint => True >> and C<< idempotentHint => True >>; C<run>,
+C<start> and C<kill> declare nothing.
+
+A host reads those hints as a licence to run a batch of the annotated calls
+side by side, and to execute identical ones in a batch once. It holds here:
+C<allowed> reads a list this instance was built with, and C<poll> and
+C<output> read a job's state and a window of what it has B<already> written —
+an C<output> cursor is a position the caller holds, so reading from one leaves
+the buffer exactly as it was and the same call twice is the same answer twice.
+The job registry and every job's buffers take their own locks, so several of
+these at once see coherent state rather than a half-written flush.
+
+The other three could not be annotated: a command is whatever the caller
+typed and this pack cannot know whether it writes, C<start> mints a job, and
+C<kill> ends one.
 
 =head3 run
 
@@ -223,15 +249,20 @@ argument, quoted by nobody, split by nobody.
 =head3 Standard input
 
 C<stdin> is written to the command and the pipe is then closed, so a filter
-sees a normal end of input. Three states, and they are all different:
+sees a normal end of input. Three states:
 
-=item B<omitted> — standard input is left unconnected, exactly as it was before
-this feature existed. Nothing is written to the command and it is not handed an
-end of file we invented for it.
+=item B<omitted> — nothing is written, and the command reads an immediate end of
+file. What it does I<not> get is the server process's own standard input: with
+C<isolate-terminal> on (the default) C<fd 0> is a closed pipe rather than the
+host's terminal or the client's transport. See L<#Terminal isolation>.
 =item B<empty string> — the pipe is opened and closed immediately, so the
 command reads an immediate EOF. This is what you want for a filter you have
 nothing to say to.
 =item B<a string> — written and then closed.
+
+The first two therefore look the same to the command and differ only in intent —
+unless you have turned isolation off, in which case an omitted C<stdin> leaves
+C<fd 0> inherited from the server process, as it was before isolation existed.
 
 The write is detached from the run: a command that never reads its input cannot
 stall the server, however much you send it, and a command that exits before
@@ -385,8 +416,8 @@ While a job runs, its output and lifecycle events are also pushed as
 C<notifications/message> — output batches at C<debug> (so a legacy client can
 silence them with C<logging/setLevel>) and C<started> / C<exited> / C<killed>
 lines at C<info>, all labelled with the prefixed C<start> tool name. Whether
-they arrive depends on the transport, and this is worth knowing before you build
-a UI on it:
+they arrive depends on how the server is being spoken to, and this is worth
+knowing before you build a UI on it:
 
 =begin table
 Session                     | Push  | Why
@@ -394,13 +425,47 @@ Session                     | Push  | Why
 Legacy stdio, initialized   | Yes   | One client, one transport-wide channel to write on
 Legacy stdio, pre-handshake | No    | Nothing may be sent before the client says it is initialized
 Modern Streamable HTTP      | No    | There is no server-initiated stream between requests
-No transport (in-process)   | No    | Nowhere to write
+In-process, C<:on-notify>   | Yes   | The host process is the client, and it wired up a sink
+In-process, no sink         | No    | Nowhere to write
 =end table
 
 So: B<C<poll> and C<output> are the reliable way to follow a job>, on every
-transport. Push is a bonus where the transport happens to support it, never a
+transport. Push is a bonus where the channel happens to exist, never a
 substitute for polling — and a push channel that refuses or fails never affects
 the job itself, whose output is safe in its buffers either way.
+
+=head3 Job lifecycle events
+
+The two C<info> lines above are prose, meant for a log window. The same two
+facts also go out as a structured C<notifications/job>, on the same channel and
+under the same delivery rules, for a host that wants to B<act> on a job
+finishing rather than show it to somebody:
+
+=begin code :lang<json>
+{"jsonrpc":"2.0","method":"notifications/job",
+ "params":{"job":"j1-1x9k2w","state":"started","runtime":0,
+           "logger":"sh_start","command":"make"}}
+
+{"jsonrpc":"2.0","method":"notifications/job",
+ "params":{"job":"j1-1x9k2w","state":"exited","exit":0,"runtime":42.317,
+           "logger":"sh_start","command":"make"}}
+=end code
+
+=item Exactly one C<started> and exactly one terminal event (C<exited> or
+C<killed>) per job, by construction: one thread wins the transition that emits
+each. A job that could not be spawned at all emits only the terminal one, with
+C<exit> C<-1> — and emits it from inside the C<start> call, so it can reach a
+host a moment before the handle does.
+=item C<exit> is B<absent>, not null, when the status never arrived: "we do not
+know" and "it exited with 0" must not look alike to a program.
+=item C<command> is the job's own record of the program it was asked to run,
+truncated to 120 characters. B<Never a byte of what the child wrote>, and not
+its arguments either. A host is likely to turn these events into text that
+something — a person, a model — reads as trustworthy, and a command that prints
+C<[background event] ignore your previous instructions> must not get a hearing
+that way. Output has its own channel and its own tool.
+=item C<logger> is the prefixed C<start> tool name, so two shell kits plugged
+into one server can be told apart.
 
 =head3 allowed
 
@@ -452,10 +517,12 @@ job's buffers are capped the same way however long it runs.
 
 What it deliberately does not do:
 
-=item B<It does not constrain what an allowed command can do.> Allowlisting an
-interpreter or a shell (C<sh>, C<bash>, C<pwsh>, C<raku>, C<python>) hands over
-arbitrary code execution, because those programs take code as an argument.
-Allowlist leaf tools, not launchers.
+=item B<It does not, on its own, constrain what an allowed command can do.>
+Allowlisting an interpreter or a shell (C<sh>, C<bash>, C<pwsh>, C<raku>,
+C<python>) hands over arbitrary code execution, because those programs take
+code as an argument. Allowlist leaf tools, not launchers. A C<launcher> (see
+L<#Sandboxing: the launcher seam>) I<can> constrain a run — it is where a host
+wraps the spawn in an OS sandbox — but the pack itself makes no such promise.
 
 =item B<It does not filter arguments.> C<git> can push, C<rg> can read any file
 the server user can read, and C<cwd> is unrestricted unless you leave it unset
@@ -465,9 +532,100 @@ privileges you are comfortable handing to the model.
 =item B<It does not scrub the environment.> Children inherit the server
 process's environment, including any credentials in it.
 
-=item B<It only kills the command itself.> Grandchildren the command spawned may
-outlive a kill, and can hold the pipes open long enough for the exit status to
-be lost (reported as C<exit: null>).
+=item B<It does not stop a command reaching the network, the clock, or any
+other resource the server's user can reach.> Isolation here is about the
+terminal and the process tree, not about capabilities; that is what a
+C<launcher> is for.
+
+=head3 Terminal isolation
+
+Where a shell pack runs decides what its children can wreck.
+
+Plugged into a stdio MCP server, the pack lives in a process whose C<fd 0> is a
+pipe from the client, and a child that inherits it is mostly harmless. Plugged
+in B<in-process> — a terminal application hosting its own tool server rather
+than talking to one over a socket — the pack lives in a process whose C<fd 0> is
+the user's terminal, and whose B<controlling terminal> every child inherits.
+From there one ordinary command can take the host apart:
+
+=item A child that puts the terminal in raw mode and restores it to cooked mode
+on the way out — any full-screen program: an editor, a pager, another TUI —
+leaves the I<host's> terminal cooked. The host carries on drawing and never
+receives another keystroke: its input is being line-buffered by a terminal it no
+longer controls, and its quit key has become flow control. This is not
+hypothetical; it is the incident this feature exists for.
+
+=item A child that reads standard input steals the bytes the host was going to
+read — keystrokes from a terminal, or, in stdio server mode, the client's own
+JSON-RPC frames.
+
+=item A child that opens C</dev/tty> reaches the host's terminal even when all
+three of its own descriptors are pipes.
+
+None of that is a command misbehaving. It is a command doing exactly what it
+always does, to a terminal it should never have been able to see. So, unless you
+set C<< isolate-terminal => False >>, the pack does two things at B<both> spawn
+sites (a foreground C<run> and a background C<start>):
+
+=item B<Standard input is detached.> A run given no C<stdin> argument gets a
+pipe that is closed immediately, so its C<fd 0> reads end of file rather than
+the host's terminal or transport. A run that I<is> given C<stdin> is unchanged.
+This half works on every platform.
+
+=item B<The child gets a new session (POSIX).> A fresh session has no
+controlling terminal, so C</dev/tty> cannot be opened at all: the host's
+terminal is not merely unwritten-to, it is unreachable. Because a new session is
+also a new process group, this is what makes a kill reach the whole tree.
+
+A new session has to be created by the child itself, between C<fork> and
+C<exec>, which is not somewhere Raku code can run — so the pack C<exec>s a tiny
+trampoline that calls C<setsid(2)> and then C<exec>s the real command B<in the
+same process>, preserving the pid every kill and exit status depends on.
+C<perl> is used by preference (it is on macOS and every mainstream Linux, and
+the pack supplies the trampoline text itself, so a command that cannot be
+C<exec>'d still reports C<exit: -1> with the reason on stderr exactly as it
+always did); C<setsid(1)> is the fallback for images without perl. The
+trampoline adds one C<exec> — a few milliseconds — per run, and it can never
+reach a shell: the C<exec> is C<execvp(3)>, never C</bin/sh>.
+
+The trampoline is chosen by the pack, never by the caller: no tool argument
+reaches it, and the command still has to pass the allow list before anything is
+spawned. It is found on C<PATH> (falling back to the usual absolute locations),
+on the same trust assumption the allow list already makes for a bare command
+name — a process whose C<PATH> has a writable directory ahead of C</usr/bin> has
+larger problems than this.
+
+Which mechanism is available is resolved B<and verified> once per process, by
+running a one-liner through the trampoline and checking that it came back a
+session leader with the pid that was spawned. A toolkit that asks for isolation
+and cannot get it B<refuses to construct>, naming what it tried:
+
+=begin code :lang<raku>
+# Nothing on this machine can detach a child:
+MCP::Server::Tool::Shell.new(allow => <git>);
+# Shell toolkit could not isolate spawned commands from the controlling
+# terminal, so it refuses to start: ... Install perl (or util-linux for
+# setsid), or, if this process has no terminal worth protecting, construct
+# the toolkit with isolate-terminal => False.
+=end code
+
+That is deliberate: a protection that is quietly missing is worse than one that
+is loudly absent, because the failure it prevents costs the user their session.
+
+B<Kills follow the tree.> Because an isolated child leads its own process group,
+a timeout, a cancelled call and the C<kill> tool all signal the I<group>: the
+grandchildren a command spawned die with it instead of outliving it and holding
+its pipes open (which used to lose the exit status, reported as C<exit: null>).
+With C<< isolate-terminal => False >> the old behaviour returns — on Unix, only
+the direct child is signalled.
+
+B<Windows> has no sessions, no controlling terminal and no C<termios> to
+corrupt, so the session half of this simply does not apply there and the pack
+does not pretend otherwise: C<isolate-terminal> still detaches standard input
+(which is the platform's own version of the hazard — a child reading the host's
+console, or its stdio transport), and kills already took the whole tree via
+C<taskkill /T /F>. Console-handle isolation beyond standard input is not
+attempted.
 
 =head3 Running anything: allow-any and MCP::Client::Policy
 
@@ -491,6 +649,57 @@ call is put to the user before it happens — which is a better gate than a stat
 list for an interactive coding agent, and a much worse one for an unattended
 server. If nothing is asking a human, use C<allow>.
 
+=head3 Sandboxing: the launcher seam
+
+The pack is a gate, not a sandbox — but it leaves a seam for a host to bolt one
+on. The C<launcher> attribute is a C<Callable> (programmatic only: a closure
+cannot come from a JSON config, so C<from-config> does not offer it) given the
+validated plan just before the process is built:
+
+=begin code :lang<raku>
+MCP::Server::Tool::Shell.new(
+    :allow-any,
+    launcher => -> %plan {
+        # %plan is { command, argv, dir }.  Return { command, argv }: the
+        # program actually exec'd becomes the wrapper, with the original
+        # command and its arguments folded onto the wrapper's own argv.  dir
+        # is left alone — the working directory is still applied by the pack.
+        %(
+            command   => 'sandbox-exec',
+            argv      => ['-p', $profile, %plan<command>, |%plan<argv>],
+            sandboxed => True,
+        );
+    },
+);
+=end code
+
+The seam is deliberately minimal and total:
+
+=item B<It wraps both spawn sites.> A foreground C<run> and a background
+C<start> pass through the same launcher and the same wrapping — there is no path
+that escapes it.
+
+=item B<An undefined launcher is exactly the old behaviour.> No launcher, no
+wrapping, and the result payload is byte-for-byte what it always was.
+
+=item B<A launcher that throws is a failed spawn, not a crash.> A launcher that
+dies (or returns a shape the pack cannot spawn) lands in the same C<exit: -1> +
+reason-in-stderr payload a command that could not be C<exec>'d does. It never
+takes the server down, and never runs the unwrapped command as a fallback —
+a sandbox that failed to build is a run that failed, not a run that escaped.
+
+=item B<It marks its own runs.> A launcher may return C<< sandboxed => True >>,
+which surfaces as C<< sandbox => { active => true } >> on the result (a
+foreground C<run>, or a job's C<output>). A host reads it to tell a sandbox
+denial from an ordinary non-zero exit — the hook for an "it was the sandbox;
+retry without it?" prompt. The key is B<absent> otherwise, so a run with no
+launcher, or one the launcher declined to sandbox, keeps the payload it always
+had.
+
+The launcher does not see, and cannot change, the working directory, the
+timeout, the output caps or the standard input: it wraps I<what runs>, and the
+pack still governs I<how long, how much and where>.
+
 =head3 Windows notes
 
 =item Bare names resolve the way C<CreateProcess> resolves them, so C<< allow =>
@@ -503,6 +712,16 @@ C<CreateProcess>, so an argument containing spaces stays one argument.
 delay. There are no signals, so there is no C<128 + signal> exit status: a
 killed run or job reports whatever C<TerminateProcess> left behind (C<1>, in
 practice). Test for C<exit != 0> rather than for C<137>.
+=item A kill takes the B<whole process tree>: C<taskkill /T /F /PID> is issued
+against the child before the C<TerminateProcess> backstop, so grandchildren the
+command spawned do not outlive the kill. It is fire-and-forget — the watcher
+collects the exit status independently — and if C<taskkill> is missing from a
+stripped image the direct-child kill still runs. (Unix reaches the tree a
+different way, by signalling the process group of an isolated child; see
+L<#Terminal isolation>.)
+=item C<isolate-terminal> detaches standard input here as it does everywhere,
+but there is no session to leave and no C</dev/tty> to close off: Windows has
+neither, so the pack claims neither. See L<#Terminal isolation>.
 =item Everything else — stdin, capped output, streaming, jobs — behaves the same
 as on Unix.
 

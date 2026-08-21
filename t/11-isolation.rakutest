@@ -1,0 +1,451 @@
+use Test;
+use lib 't/lib';
+use ShellTest;
+use NativeCall;
+use JSON::Fast;
+use MCP::Server;
+use MCP::Server::Tool::Shell;
+use MCP::Server::Tool::Shell::Jobs;
+use MCP::Server::Tool::Shell::Isolation;
+
+# Terminal isolation: what keeps a spawned command away from the terminal of
+# the process hosting the pack.  The incident these tests exist for is a child
+# that put the host's terminal back into cooked mode on its way out, after
+# which the host — still drawing perfectly — never saw another keystroke.
+#
+# Everything here is asserted from outside the child, in ways that hold on both
+# a POSIX box and Windows: what the child could read on fd 0, what session it
+# ended up in, whether it could reach /dev/tty, and whether the things it
+# started died with it.
+
+plan 12;
+
+my constant IS-WIN = $*DISTRO.is-win;
+
+my $raku = raku-path();
+
+# The child reports the session it landed in and the pid it landed there with.
+# NativeCall rather than ps(1): every ps flavour spells the column differently,
+# and getsid(2) is the question the flavours are all approximating.
+my constant SID-PROBE = 'use NativeCall; sub getsid(int32 --> int32) is native(Str) {*}; '
+	~ 'print getsid(0) ~ ":" ~ $*PID';
+
+my constant TTY-PROBE = 'my $h = try "/dev/tty".IO.open(:r); '
+	~ 'print $h.defined ?? "opened" !! "refused"; '
+	~ '$h.close if $h.defined';
+
+my constant SLURP-PROBE = 'my $t = ""; try { $t = $*IN.slurp }; print "[$t]"';
+
+# POSIX descriptor plumbing, used by exactly one subtest to give the host
+# process something on fd 0 worth stealing.  Windows has no portable equivalent
+# reachable from here — MoarVM's own CRT is not necessarily the one these
+# symbols would come from — so that subtest asserts the same property the other
+# way round there.
+sub c-open(Str, int32 --> int32) is native(Str) is symbol('open') { * }
+sub c-dup(int32 --> int32) is native(Str) is symbol('dup') { * }
+sub c-dup2(int32, int32 --> int32) is native(Str) is symbol('dup2') { * }
+sub c-close(int32 --> int32) is native(Str) is symbol('close') { * }
+sub c-getsid(int32 --> int32) is native(Str) is symbol('getsid') { * }
+sub c-kill(int32, int32 --> int32) is native(Str) is symbol('kill') { * }
+
+sub shell-server(:@allow = ($raku,), *%config --> MCP::Server:D) {
+	my $server = MCP::Server.new(:name<isolation>);
+	$server.plug: MCP::Server::Tool::Shell.new(:@allow, |%config);
+	$server;
+}
+
+# A scratch directory for the two scripts the tree-kill subtests need, and for
+# the heartbeat files they watch.
+my $work = $*TMPDIR.add("mcp-shell-isolation-{$*PID}-{now.Int}");
+$work.mkdir;
+END { try { .unlink for $work.dir; $work.rmdir } }
+
+# A grandchild: something the command under test starts, which a kill of the
+# command alone would leave running.  It writes its pid once, then a byte every
+# tenth of a second, and gives up after a minute so a test that fails to kill it
+# cannot leave a process writing to the temp directory forever.
+my $gchild = $work.add('gchild.raku');
+$gchild.spurt: q:to/RAKU/;
+	my $beat = @*ARGS[0].IO;
+	"{@*ARGS[0]}.pid".IO.spurt($*PID);
+	for ^600 {
+		$beat.spurt('x', :append);
+		sleep 0.1;
+	}
+	RAKU
+
+my $child = $work.add('child.raku');
+$child.spurt: q:to/RAKU/;
+	my $proc = Proc::Async.new($*EXECUTABLE.absolute, @*ARGS[0], @*ARGS[1]);
+	$proc.stdout.tap(-> $chunk { });
+	$proc.stderr.tap(-> $chunk { });
+	$proc.start;
+	print "spawned";
+	sleep 300;
+	RAKU
+
+#| A fresh heartbeat file, and the pid file its writer will drop beside it.
+sub heartbeat(Str:D $name --> IO::Path:D) {
+	my $beat = $work.add($name);
+	$beat.spurt('');
+	$beat;
+}
+
+#| The grandchild's pid, once it has written it.
+sub heartbeat-pid(IO::Path:D $beat --> Int) {
+	my $pid-file = "{$beat.absolute}.pid".IO;
+	return Int unless $pid-file.e;
+	my $raw = try $pid-file.slurp;
+	($raw // '').trim ~~ /^ \d+ $/ ?? $raw.trim.Int !! Int;
+}
+
+#| Has the heartbeat stopped?  Polled rather than slept at: a live writer
+#| touches the file every 0.1s, so a whole quiet window means the writer is
+#| gone.  Returns as soon as one quiet window passes, and gives up after
+#| $timeout so a surviving grandchild fails the test instead of hanging it.
+sub heartbeat-stopped(IO::Path:D $beat, Real:D :$quiet = 1, Real:D :$timeout = 30 --> Bool:D) {
+	my $deadline = now + $timeout;
+	while now < $deadline {
+		my $before = $beat.s;
+		sleep $quiet;
+		return True if $beat.s == $before;
+	}
+	False;
+}
+
+#| Kill a survivor so a failing assertion does not leak a process.
+sub reap-heartbeat(IO::Path:D $beat --> Nil) {
+	my $pid = heartbeat-pid($beat);
+	return without $pid;
+
+	if IS-WIN {
+		# Bound to a variable rather than sunk: sinking the Proc of a taskkill
+		# that found nothing to kill would throw.
+		my $ = try shell("taskkill /F /PID $pid");
+	}
+	else {
+		c-kill($pid, Signal::SIGKILL.value);
+	}
+	Nil;
+}
+
+subtest 'The process resolves a mechanism, and says which' => {
+	plan IS-WIN ?? 5 !! 7;
+	my $isolation = resolve-isolation();
+
+	ok $isolation.detach-stdin, 'standard input is detached on every platform';
+	ok $isolation.describe.contains('terminal isolation'), 'it can describe itself';
+
+	if IS-WIN {
+		is $isolation.mechanism, 'none',
+			'Windows has no session to leave, and says so rather than pretending';
+		nok $isolation.new-session, 'so no new session is claimed';
+		is-deeply $isolation.wrap('git', ['status']),
+			%( command => 'git', argv => ('status',) ),
+			'and nothing wraps the command';
+	}
+	else {
+		ok $isolation.mechanism eq any('perl', 'setsid'),
+			"a POSIX mechanism was found ({$isolation.mechanism})";
+		ok $isolation.new-session, 'which puts each child in a session of its own';
+		ok $isolation.program.IO.e, "via an existing program ({$isolation.program})";
+		my %wrapped = $isolation.wrap('git', ['status']);
+		is %wrapped<command>, $isolation.program, 'the trampoline is what gets exec\'d';
+		is-deeply %wrapped<argv>.tail(2).List, ('git', 'status'),
+			'with the command and its argv folded onto the end';
+	}
+};
+
+subtest 'A run given no stdin cannot read the host\'s' => {
+	plan IS-WIN ?? 3 !! 8;
+	my $server = shell-server;
+
+	# Everywhere: no standard input means end of file, promptly.  A child that
+	# inherited a terminal would block on the slurp until the budget ran out.
+	my %got = run-ok($server,
+		{ command => $raku, args => ['-e', SLURP-PROBE], timeout => 20 },
+		'no stdin',
+	);
+	is %got<stdout>, '[]', 'The command saw end of file';
+	nok %got<timed-out>, 'and did not sit waiting for input that was never coming';
+
+	unless IS-WIN {
+		# The strong form: put something on the host's own fd 0 and check that
+		# the child cannot see it.  The control is the same run with isolation
+		# turned off, which proves the fixture is real rather than the file
+		# being unreadable for some unrelated reason.
+		my $secret = $work.add('fd0-secret');
+		$secret.spurt('SECRET-BYTES');
+
+		my $saved = c-dup(0);
+		my $fd = c-open($secret.absolute, 0);   # O_RDONLY
+		LEAVE {
+			if $saved >= 0 {
+				c-dup2($saved, 0);
+				c-close($saved);
+			}
+		}
+		if $fd >= 0 {
+			c-dup2($fd, 0);
+			c-close($fd);
+		}
+		ok $fd >= 0 && $saved >= 0, 'the fixture could take over fd 0';
+
+		my %stolen = run-ok(shell-server(isolate-terminal => False),
+			{ command => $raku, args => ['-e', SLURP-PROBE], timeout => 20 },
+			'control, isolation off',
+		);
+		is %stolen<stdout>, '[SECRET-BYTES]',
+			'Without isolation a child reads whatever the host had on fd 0';
+
+		my %isolated = run-ok($server,
+			{ command => $raku, args => ['-e', SLURP-PROBE], timeout => 20 },
+			'isolated',
+		);
+		is %isolated<stdout>, '[]', 'With it, the child gets nothing of the host\'s';
+	}
+};
+
+subtest 'Supplied standard input still arrives, isolation or not' => {
+	plan 6;
+	for (True, False) -> $isolate {
+		my $server = shell-server(isolate-terminal => $isolate);
+		my %got = run-ok($server,
+			{
+				command => $raku,
+				args    => ['-e', 'print $*IN.slurp.uc'],
+				stdin   => "hello\n",
+				timeout => 20,
+			},
+			"stdin round trip (isolate-terminal => $isolate)",
+		);
+		is %got<stdout>, "HELLO\n", 'what was sent is what arrived';
+		is %got<exit>, 0, 'and the command exited cleanly';
+	}
+};
+
+subtest 'POSIX: the child runs in a session of its own' => {
+	plan IS-WIN ?? 2 !! 6;
+
+	if IS-WIN {
+		# Windows has no sessions and no controlling terminal, so there is
+		# nothing to detach from; the platform's own hazard (a child reading the
+		# host's console, or its stdio transport) is answered by the stdin
+		# detachment asserted above.  Assert the documented position rather than
+		# pretending the mechanism exists.
+		nok resolve-isolation().new-session, 'no new session is claimed on Windows';
+		ok resolve-isolation().detach-stdin, 'but standard input is still detached';
+	}
+	else {
+		my $ours = c-getsid(0);
+		ok $ours > 0, "the test process has a session ($ours)";
+
+		my %isolated = run-ok(shell-server,
+			{ command => $raku, args => ['-e', SID-PROBE], timeout => 30 },
+			'isolated run',
+		);
+		my ($sid, $pid) = %isolated<stdout>.split(':').map(*.Int);
+		isnt $sid, $ours, "The child left the host's session (child sid $sid)";
+		is $sid, $pid, 'and leads the new one, so it has no controlling terminal';
+
+		my %inherited = run-ok(shell-server(isolate-terminal => False),
+			{ command => $raku, args => ['-e', SID-PROBE], timeout => 30 },
+			'control, isolation off',
+		);
+		is %inherited<stdout>.split(':')[0].Int, $ours,
+			'Opting out puts the child back in the host\'s session';
+	}
+};
+
+subtest 'POSIX: an isolated child cannot open /dev/tty' => {
+	plan IS-WIN ?? 1 !! 3;
+
+	if IS-WIN {
+		ok True, 'there is no /dev/tty on Windows to reach for';
+	}
+	else {
+		# A session with no controlling terminal has no /dev/tty to open, which
+		# is the whole point: a child cannot reach the host's terminal even
+		# though all three of its own descriptors are pipes.  The control says
+		# whether this harness had a terminal to reach in the first place — under
+		# a CI runner it will not, and the assertion is then true for both
+		# reasons at once rather than false for either.
+		my %control = run-ok(shell-server(isolate-terminal => False),
+			{ command => $raku, args => ['-e', TTY-PROBE], timeout => 30 },
+			'control, isolation off',
+		);
+		diag "the harness itself {%control<stdout> eq 'opened' ?? 'has' !! 'has no'} controlling terminal";
+
+		my %got = run-ok(shell-server,
+			{ command => $raku, args => ['-e', TTY-PROBE], timeout => 30 },
+			'isolated run',
+		);
+		is %got<stdout>, 'refused', 'The isolated child could not open /dev/tty';
+	}
+};
+
+subtest 'A timed-out run takes the grandchildren with it' => {
+	plan 4;
+	my $beat = heartbeat('fg-beat');
+	LEAVE reap-heartbeat($beat);
+
+	my $server = shell-server;
+	my %got = run-ok($server,
+		{
+			command => $raku,
+			args    => [$child.absolute, $gchild.absolute, $beat.absolute],
+			timeout => 3,
+		},
+		'a command that starts something of its own',
+	);
+	ok %got<timed-out>, 'The run hit its budget and was killed';
+	ok $beat.s > 0, 'the grandchild had been running';
+	ok heartbeat-stopped($beat), 'and stopped when its parent was killed';
+};
+
+subtest 'Killing a job takes the grandchildren with it' => {
+	plan 5;
+	my $beat = heartbeat('job-beat');
+	LEAVE reap-heartbeat($beat);
+
+	my $server = shell-server;
+	my %start = json-ok($server, 'sh_start',
+		{ command => $raku, args => [$child.absolute, $gchild.absolute, $beat.absolute] },
+		'start',
+	);
+	ok wait-until({ $beat.s > 0 }), 'The job\'s own child started writing';
+
+	json-ok($server, 'sh_kill', { job => %start<job> }, 'kill');
+	ok wait-until({
+		from-json(text(call($server, 'sh_poll', { job => %start<job> })))<state> ne 'running'
+	}), 'The job stopped';
+
+	ok heartbeat-stopped($beat), 'and so did the grandchild it had started';
+};
+
+subtest 'A command that cannot be exec\'d is still a spawn failure' => {
+	plan IS-WIN ?? 4 !! 5;
+	# The trampoline replaces the process before the command is exec'd, so a
+	# missing command comes back as an ordinary exit of the trampoline rather
+	# than as a broken start promise.  The payload must not notice: exit -1 with
+	# the reason on stderr is what "could not be spawned" has always looked
+	# like, and callers key on it.
+	my $ghost = $work.add('no-such-command').absolute;
+	my $server = shell-server(allow => [$ghost]);
+
+	my %got = run-ok($server, { command => $ghost, timeout => 30 }, 'missing command');
+	is %got<exit>, -1, 'exit is -1, not the trampoline\'s own status';
+	is %got<stdout>, '', 'nothing on stdout';
+	ok %got<stderr>.chars > 0, 'and the reason on stderr';
+	ok %got<stderr>.contains($ghost), 'naming the command that could not be run'
+		unless IS-WIN;
+};
+
+subtest 'The trampoline never reaches a shell' => {
+	plan 3;
+	# A command name full of shell metacharacters: if anything in the isolation
+	# path handed this to sh -c, the semicolon would run a second command and the
+	# error would be the shell's, not a failure to exec this exact name.
+	my $evil = $work.add('ghost; echo pwned #').absolute;
+	my $server = shell-server(allow => [$evil]);
+
+	my %got = run-ok($server, { command => $evil, timeout => 30 }, 'metacharacter command');
+	is %got<exit>, -1, 'it simply could not be exec\'d';
+	is %got<stdout>, '', 'and nothing else ran';
+};
+
+subtest 'Isolation.wrap and normalize-exit' => {
+	plan 10;
+	my $off = isolation-off();
+	is $off.mechanism, 'off', 'an opted-out isolation says so';
+	nok $off.new-session, 'it detaches nothing';
+	nok $off.detach-stdin, 'and leaves standard input alone';
+	is-deeply $off.wrap('git', ['status', '-s']),
+		%( command => 'git', argv => ('status', '-s') ),
+		'wrap is the identity without a trampoline';
+	is $off.normalize-exit(127, { die 'must not be consulted' }), 127,
+		'and an exit status is never rewritten';
+
+	my $iso = resolve-isolation();
+	if $iso.new-session {
+		my $prefix = $iso.mechanism eq 'perl' ?? 'mcp-shell-tool: ' !! 'setsid: ';
+		is $iso.normalize-exit(127, { $prefix ~ 'could not run x' }), -1,
+			'a trampoline diagnostic plus its status is a failed spawn';
+		is $iso.normalize-exit(127, { 'ordinary output' }), 127,
+			'the same status without the diagnostic is the command\'s own';
+		is $iso.normalize-exit(0, { $prefix ~ 'could not run x' }), 0,
+			'and the diagnostic alone rewrites nothing';
+		is $iso.normalize-exit(Int, { $prefix }).defined, False,
+			'an unknown status stays unknown';
+		is $iso.normalize-exit(1, { die 'must not be consulted' }), 1,
+			'a status that cannot be the trampoline\'s never costs a snapshot';
+	}
+	else {
+		# Windows: nothing wraps, so nothing is ever rewritten.
+		is $iso.normalize-exit(127, { 'anything' }), 127, 'nothing is rewritten';
+		is $iso.normalize-exit(126, { 'anything' }), 126, 'whatever the status';
+		is $iso.normalize-exit(0, { 'anything' }), 0, 'including success';
+		is $iso.normalize-exit(Int, { 'anything' }).defined, False, 'or no status at all';
+		is-deeply $iso.wrap('git', ()), %( command => 'git', argv => () ),
+			'and wrap is the identity';
+	}
+};
+
+subtest 'Resolution fails loudly rather than quietly unprotected' => {
+	plan IS-WIN ?? 2 !! 3;
+
+	dies-with { build-isolation([]) },
+		'could not isolate spawned commands from the controlling terminal',
+		'No mechanism at all is a refusal to start';
+
+	dies-with {
+		build-isolation([
+			{
+				mechanism => 'perl',
+				names => ('mcp-shell-no-such-trampoline',),
+				paths => (),
+				args => (),
+				'failure-prefix' => 'x: ',
+				'failure-statuses' => (127,),
+			},
+		])
+	}, 'no mcp-shell-no-such-trampoline on PATH',
+		'A mechanism that is not installed is named in the refusal';
+
+	unless IS-WIN {
+		# Present, runnable, and does not do the one thing it is there for: the
+		# check has to catch it, because nothing about the filesystem would.
+		dies-with {
+			build-isolation([
+				{
+					mechanism => 'perl',
+					names => ('perl',),
+					paths => ('/usr/bin/perl',),
+					args => ('-e', 'print "I am not a trampoline"'),
+					'failure-prefix' => 'x: ',
+					'failure-statuses' => (127,),
+				},
+			])
+		}, 'did not become a session leader',
+			'A mechanism that does not detach is caught by the check, not by a user';
+	}
+};
+
+subtest 'Process-group and pid helpers' => {
+	plan 5;
+	nok kill-process-group(0), 'group 0 is never signalled (it is the caller\'s own)';
+	nok kill-process-group(-1), 'nor is a negative pid';
+
+	my $proc = Proc::Async.new($raku, '-e', 'sleep 30');
+	nok process-pid($proc).defined, 'an unstarted process has no pid to report';
+
+	$proc.stdout.tap(-> $ { }, quit => -> $ { });
+	$proc.stderr.tap(-> $ { }, quit => -> $ { });
+	my $done = $proc.start;
+	ok wait-until({ process-pid($proc).defined }), 'a started one reports its pid';
+
+	kill-process-tree($proc, group => !IS-WIN);
+	ok wait-until({ $done.status !=== Planned }), 'and a tree kill settles it';
+};
+
+done-testing;

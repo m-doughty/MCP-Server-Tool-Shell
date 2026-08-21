@@ -1,0 +1,163 @@
+use Test;
+use lib 't/lib';
+use ShellTest;
+use JSON::Fast;
+use MCP::Server;
+use MCP::Server::Tool::Shell;
+
+# Which of this pack's six tools tell a host they are safe to run beside their
+# neighbours, and what that has to be true of.
+#
+# Three do: "allowed" reads a list this instance was built with, and "poll" and
+# "output" read a job's state and a window of what it has already written.
+# Three do not, and could not: a command is whatever the model typed, "start"
+# mints a job and "kill" ends one.
+
+plan 5;
+
+my $raku = raku-path();
+
+sub shell-server(*%config --> MCP::Server:D) {
+	my $server = MCP::Server.new(:name<annotations>, |(%config<tool-concurrency>:exists
+		?? (tool-concurrency => %config<tool-concurrency>:delete) !! ()));
+	$server.plug: MCP::Server::Tool::Shell.new(allow => [$raku], |%config);
+	$server;
+}
+
+sub tool-annotations($server --> Hash:D) {
+	$server.handle-request({
+		jsonrpc => '2.0', id => 1, method => 'tools/list',
+	})<result><tools>
+		.grep({ $_<annotations>:exists })
+		.map({ $_<name> => $_<annotations>.Hash })
+		.Hash;
+}
+
+subtest 'the introspection tools are annotated, the acting ones are not' => {
+	plan 3;
+
+	my %annotated = tool-annotations(shell-server);
+
+	is-deeply %annotated.keys.sort.List,
+		<sh_allowed sh_output sh_poll>.List,
+		'exactly the three reads carry annotations';
+	is-deeply %annotated.values.unique(:with(&[eqv])).List,
+		(%( readOnlyHint => True, idempotentHint => True ),),
+		'and all three say the same two things';
+
+	my @names = shell-server.handle-request({
+		jsonrpc => '2.0', id => 2, method => 'tools/list',
+	})<result><tools>.grep({ !($_<annotations>:exists) }).map({ $_<name> }).sort;
+	is-deeply @names.List, <sh_kill sh_run sh_start>.List,
+		'while run, start and kill say nothing: a host must decide for '
+			~ 'itself whether two of those may happen at once';
+};
+
+subtest 'polling and reading one live job from several slots at once' => {
+	plan 6;
+
+	# The registry and every job's output buffers take their own locks, which
+	# is what these annotations are a claim about. This drives a batch of reads
+	# at one job WHILE it writes, several rounds over, four wide.
+	my $server = shell-server(tool-concurrency => 4);
+	my %start = json-ok($server, 'sh_start', {
+		command => $raku,
+		args => ['-e', '$*OUT.out-buffer = 0; for ^8 { print "tick$_\n"; sleep 0.05 }'],
+	}, 'start');
+	my $job = %start<job>;
+
+	# Pushed one at a time rather than flattened together: `flat` over a list
+	# of Hashes flattens the HASHES into pairs, and the batch that comes out
+	# of that is not a batch of tool calls at all.
+	#
+	# The cursors differ so these are five DISTINCT reads rather than one read
+	# fanned out five ways -- the whole point here is several of them inside
+	# the buffer at the same moment.
+	my @calls;
+	@calls.push: %( id => 'p', function => %( name => 'sh_poll',
+		arguments => %( job => $job ) ) );
+	@calls.push: %( id => "o$_", function => %( name => 'sh_output',
+		arguments => %( job => $job, cursor => "$_:0:0:0" ) ) ) for ^5;
+	@calls.push: %( id => 'a', function => %( name => 'sh_allowed',
+		arguments => %() ) );
+
+	my @rounds = (^4).map({ $server.execute-tool-calls(@calls) }).List;
+
+	is-deeply @rounds.map({ $_.map({ $_<tool_call_id> }).List })
+			.unique(:with(&[eqv])).List,
+		((|('p',), |(^5).map({ "o$_" }), 'a').List,).List,
+		'every round answers every slot, in the order it was asked in';
+	is @rounds.map({ $_.list }).flat.grep({ $_<is_error> }).elems, 0,
+		'and not one of the twenty-eight answers is an error';
+
+	my @polls = @rounds.map({ from-json($_[0]<content>) });
+	is @polls.map({ $_<job> }).unique.List, ($job,).List,
+		'every poll is about the job that was asked about';
+	ok @polls.map({ $_<runtime> }).grep({ $_ >= 0 }).elems == @polls.elems,
+		'and every one of them reports a coherent runtime rather than a '
+			~ 'half-written status';
+
+	ok wait-until({ from-json(text(call($server, 'sh_poll',
+		{ job => $job })))<state> ne 'running' }),
+		'and the job it was all read from ran to the end';
+};
+
+subtest 'an sh_run in the batch makes the whole batch a sequence' => {
+	plan 2;
+
+	# Which is the point: a poll beside a command is a poll that may be
+	# reading a world the command is in the middle of changing.
+	my $server = shell-server;
+	my @results = $server.execute-tool-calls((
+		%( id => 'a', function => %( name => 'sh_allowed', arguments => %() ) ),
+		%( id => 'b', function => %( name => 'sh_run', arguments => %(
+			command => $raku, args => ['-e', 'print "ran"'] ) ) ),
+		%( id => 'c', function => %( name => 'sh_allowed', arguments => %() ) ),
+	));
+
+	is @results.map({ $_<tool_call_id> }).List, <a b c>.List, 'three answers, in order';
+	is from-json(@results[1]<content>)<stdout>, 'ran', 'and the command ran';
+};
+
+subtest 'an unknown job is still an error per slot' => {
+	plan 2;
+
+	my $server = shell-server;
+	my @results = $server.execute-tool-calls((
+		%( id => 'a', function => %( name => 'sh_poll',
+			arguments => %( job => 'no-such-job' ) ) ),
+		%( id => 'b', function => %( name => 'sh_allowed', arguments => %() ) ),
+	));
+
+	ok @results[0]<is_error>, 'the poll of a job that never existed failed';
+	nok @results[1]<is_error>,
+		'and the read beside it answered — one call\'s failure is one '
+			~ 'call\'s failure, however wide the batch ran';
+};
+
+subtest 'sh_output with a cursor stays a read' => {
+	plan 4;
+
+	# A cursor is a position the CALLER holds: reading from one leaves the
+	# buffer exactly as it was, which is what makes "output" idempotent
+	# rather than a queue that drains.
+	my $server = shell-server;
+	my %start = json-ok($server, 'sh_start',
+		{ command => $raku, args => ['-e', 'print "abcdef"'] }, 'start');
+	my $job = %start<job>;
+	ok wait-until({ from-json(text(call($server, 'sh_poll',
+		{ job => $job })))<state> ne 'running' });
+
+	my %first = from-json(text(call($server, 'sh_output', { job => $job })));
+	my @results = $server.execute-tool-calls((
+		%( id => 'a', function => %( name => 'sh_output',
+			arguments => %( job => $job ) ) ),
+		%( id => 'b', function => %( name => 'sh_output',
+			arguments => %( job => $job ) ) ),
+	));
+
+	is from-json(@results[0]<content>)<stdout>, %first<stdout>,
+		'a second read of the whole snapshot says what the first one did';
+	is @results[0]<content>, @results[1]<content>,
+		'and two of them in one batch agree, whichever of them ran';
+};

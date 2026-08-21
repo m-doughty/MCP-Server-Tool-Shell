@@ -5,7 +5,7 @@ use MCP::Server;
 use MCP::Server::Toolkit;
 use MCP::Server::Tool::Shell;
 
-plan 10;
+plan 11;
 
 # The whole tool surface, as tools/list reports it.  Every subtest that checks
 # names checks all of them: a tool that quietly stops being registered is the
@@ -46,8 +46,8 @@ subtest 'from-config builds a configured toolkit' => {
 subtest 'from-config key validation' => {
 	plan 4;
 	dies-with { MCP::Server::Tool::Shell.from-config({ allow => ['git'], allowed => True }) },
-		'Valid keys: allow, allow-any, cwd, job-ttl, max-finished-jobs, max-jobs, '
-		  ~ 'max-output-bytes, max-output-lines, timeout',
+		'Valid keys: allow, allow-any, cwd, isolate-terminal, job-ttl, '
+		  ~ 'max-finished-jobs, max-jobs, max-output-bytes, max-output-lines, timeout',
 		'Unknown key dies listing the valid keys';
 
 	dies-with { MCP::Server::Tool::Shell.from-config({ timeout => 5 }) },
@@ -167,6 +167,25 @@ subtest 'Job configuration validation' => {
 
 	dies-with { MCP::Server::Tool::Shell.new(allow => ['git'], job-ttl => -5) },
 		'job-ttl must be greater than zero', 'A negative TTL dies';
+};
+
+subtest 'Terminal isolation configuration' => {
+	plan 4;
+	# The behaviour itself is t/11's subject; what belongs here is that the
+	# decision is configurable, on by default, and reachable from a JSON config
+	# (a host that keeps its toolkits in a config file must be able to opt out
+	# of isolation on a machine that cannot provide it).
+	ok MCP::Server::Tool::Shell.new(allow => ['git']).isolate-terminal,
+		'Isolation is on unless somebody turns it off';
+
+	nok MCP::Server::Tool::Shell.new(allow => ['git'], isolate-terminal => False).isolate-terminal,
+		'and can be turned off via .new';
+
+	nok MCP::Server::Tool::Shell.from-config({ allow => ['git'], 'isolate-terminal' => False }).isolate-terminal,
+		'or from a config hash';
+
+	ok MCP::Server::Tool::Shell.from-config({ allow => ['git'] }).isolate-terminal,
+		'which a config that says nothing does not do';
 };
 
 subtest 'default-prefix' => {

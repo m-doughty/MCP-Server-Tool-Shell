@@ -1,0 +1,136 @@
+use Test;
+use lib 't/lib';
+use ShellTest;
+use JSON::Fast;
+use MCP::Server;
+use MCP::Server::Tool::Shell;
+use MCP::Server::Tool::Shell::Jobs;
+
+plan 9;
+
+# Every command run here is the running Raku interpreter itself: the one
+# executable guaranteed to exist on macOS, Linux and Windows alike.
+my $raku = raku-path();
+
+subtest 'apply-launcher: no launcher passes the plan through untouched' => {
+	plan 3;
+	my %got = apply-launcher(Callable, 'git', ['status', '--short'], '/tmp'.IO);
+	is %got<command>, 'git', 'command unchanged';
+	is-deeply %got<argv>, ('status', '--short'), 'argv unchanged';
+	is %got<sandboxed>, False, 'not sandboxed without a launcher';
+};
+
+subtest 'apply-launcher: wraps and reports sandboxed' => {
+	plan 5;
+	my @seen;
+	my &l = -> %plan {
+		@seen.push(%plan);
+		%( command => 'sandbox-exec', argv => ['-p', 'PROFILE', %plan<command>, |%plan<argv>], sandboxed => True );
+	};
+	my %got = apply-launcher(&l, 'git', ['status'], '/work'.IO);
+	is %got<command>, 'sandbox-exec', 'command becomes the wrapper';
+	is-deeply %got<argv>, ('-p', 'PROFILE', 'git', 'status'), 'original folded onto the wrapper argv';
+	is %got<sandboxed>, True, 'sandboxed flag surfaced';
+	is @seen[0]<command>, 'git', 'launcher saw the original command';
+	is-deeply @seen[0]<argv>, ('status',), 'launcher saw the original argv';
+};
+
+subtest 'apply-launcher: an unspawnable shape dies (caught as a failed spawn)' => {
+	plan 3;
+	dies-with { apply-launcher(-> %p { 42 }, 'git', [], IO::Path) },
+		"must return an object", 'a non-object return dies';
+	dies-with { apply-launcher(-> %p { %( argv => [] ) }, 'git', [], IO::Path) },
+		"non-empty string 'command'", 'a missing command dies';
+	dies-with { apply-launcher(-> %p { %( command => 'x', argv => [1, 2] ) }, 'git', [], IO::Path) },
+		"'argv' entries must be strings", 'a non-string argv entry dies';
+};
+
+subtest 'Foreground run: the launcher wraps the spawn' => {
+	plan 5;
+	my @seen;
+	my &launcher = -> %plan {
+		@seen.push(%plan);
+		%( command => $raku, argv => ['-e', 'print "FG-WRAPPED"'], sandboxed => True );
+	};
+	my $server = MCP::Server.new(:name<launch-fg>);
+	$server.plug: MCP::Server::Tool::Shell.new(:allow-any, :&launcher);
+
+	my %got = run-ok($server, { command => $raku, args => ['-e', 'print "original"'] }, 'wrapped fg');
+	is %got<stdout>, 'FG-WRAPPED', 'the wrapper program ran, not the original';
+	is-deeply @seen[0]<argv>, ('-e', 'print "original"'), 'launcher received the original argv';
+	is @seen[0]<command>, $raku, 'launcher received the original command';
+	is-deeply %got<sandbox>, { active => True }, 'result carries the sandbox marker';
+};
+
+subtest 'Foreground run: no launcher leaves the payload byte-identical' => {
+	plan 3;
+	my $server = MCP::Server.new(:name<launch-none>);
+	$server.plug: MCP::Server::Tool::Shell.new(:allow-any);
+	my %got = run-ok($server, { command => $raku, args => ['-e', 'print "original"'] }, 'unwrapped');
+	is %got<stdout>, 'original', 'the original ran unchanged';
+	nok %got<sandbox>:exists, 'no sandbox key at all without a launcher';
+};
+
+subtest 'Foreground run: a throwing launcher is a failed spawn, not a crash' => {
+	plan 4;
+	my $server = MCP::Server.new(:name<launch-throw>);
+	$server.plug: MCP::Server::Tool::Shell.new(
+		:allow-any, launcher => -> %plan { die 'launcher boom' },
+	);
+	# json-ok, not errors-with: a launcher failure is reported IN the payload
+	# (exit -1, reason in stderr), exactly like a command that could not exec.
+	my %got = json-ok($server, 'sh_run', { command => $raku, args => ['-e', 'print "x"'] }, 'thrown launcher');
+	is %got<exit>, -1, 'exit -1 for a failed spawn';
+	ok %got<stderr>.contains('launcher boom'), 'the reason is in stderr';
+	nok %got<sandbox>:exists, 'no sandbox marker when the launcher never returned one';
+};
+
+subtest 'Background job: the launcher wraps the spawn and marks output' => {
+	plan 5;
+	my @seen;
+	my &launcher = -> %plan {
+		@seen.push(%plan);
+		%( command => $raku, argv => ['-e', 'print "JOB-WRAPPED"'], sandboxed => True );
+	};
+	my $server = MCP::Server.new(:name<launch-job>);
+	$server.plug: MCP::Server::Tool::Shell.new(:allow-any, :&launcher);
+
+	my %start = json-ok($server, 'sh_start', { command => $raku, args => ['-e', 'print "original"'] }, 'job start');
+	my $job = %start<job>;
+	wait-until({ from-json(text(call($server, 'sh_poll', { job => $job })))<state> ne 'running' });
+
+	my %out = json-ok($server, 'sh_output', { job => $job }, 'job output');
+	is %out<stdout>, 'JOB-WRAPPED', 'the wrapper program ran for the job';
+	is-deeply %out<sandbox>, { active => True }, 'job output carries the sandbox marker';
+	is-deeply @seen[0]<argv>, ('-e', 'print "original"'), 'launcher saw the original job argv';
+};
+
+subtest 'Background job: a throwing launcher is a failed spawn, not a crash' => {
+	plan 3;
+	my $server = MCP::Server.new(:name<launch-job-throw>);
+	$server.plug: MCP::Server::Tool::Shell.new(
+		:allow-any, launcher => -> %plan { die 'job launcher boom' },
+	);
+	# start still hands back a job handle: the failure surfaces via output as
+	# exit -1, exactly like a command that could not be exec'd.
+	my %start = json-ok($server, 'sh_start', { command => $raku, args => ['-e', 'print "x"'] }, 'job start');
+	my $job = %start<job>;
+	wait-until({ from-json(text(call($server, 'sh_poll', { job => $job })))<state> ne 'running' });
+
+	my %out = json-ok($server, 'sh_output', { job => $job }, 'job output');
+	ok %out<stderr>.contains('job launcher boom'), 'the reason is in the job stderr';
+};
+
+subtest 'kill-process-tree kills a live child (Unix path here)' => {
+	plan 1;
+	# The taskkill /T branch is Windows-only; on this host the SIGKILL backstop
+	# is what runs, and killing a live child is the observable either way.  The
+	# Windows tree-kill is gated to a Windows lane (see the Security Pod).
+	my $proc = Proc::Async.new($raku, '-e', 'sleep 60');
+	$proc.stdout.tap(-> $ { }, quit => -> $ { });
+	$proc.stderr.tap(-> $ { }, quit => -> $ { });
+	my $done = $proc.start;
+	kill-process-tree($proc);
+	my $settled = await Promise.anyof($done, Promise.in(10));
+	ok $done.status !=== Planned, 'the child was killed and its promise settled';
+};

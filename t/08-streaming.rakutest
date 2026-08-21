@@ -65,8 +65,13 @@ class StubServer {
 	}
 
 	method notifications(--> List) { $!lock.protect: { @!notifications.List } }
+
+	# Scoped to notifications/message: a job's structured lifecycle twin shares
+	# this channel and has neither a level nor a data string (see t/12).
 	method lines(Str:D $level --> List) {
-		self.notifications.grep({ $_<params><level> eq $level }).map({ $_<params><data> }).list;
+		self.notifications.grep({
+			($_<method> // '') eq 'notifications/message' && $_<params><level> eq $level
+		}).map({ $_<params><data> }).list;
 	}
 }
 
@@ -218,8 +223,9 @@ subtest 'Background jobs push on the server channel' => {
 	ok @info.all.contains($id), 'Every lifecycle line names the job';
 	ok $server.notifications.all<params><logger> eq 'sh_start',
 		'and is labelled with the prefixed start tool';
-	ok $server.notifications.all<method> eq 'notifications/message',
-		'All of it is a logging notification';
+	is $server.notifications.map({ $_<method> }).unique.sort.List,
+		('notifications/job', 'notifications/message').List,
+		'Output and prose travel as logging notifications, lifecycle also as its structured twin';
 
 	my @debug = $server.lines('debug');
 	ok @debug.grep({ .contains('job output') }).elems > 0,
@@ -283,7 +289,9 @@ subtest 'Job push reaches a legacy stdio session' => {
 		}).elems > 0
 	}), 'Its lifecycle reached the transport-wide channel';
 
-	my @pushed = $transport.messages.grep({ ($_<params><logger> // '') eq 'sh_start' });
+	my @pushed = $transport.messages.grep({
+		($_<method> // '') eq 'notifications/message' && ($_<params><logger> // '') eq 'sh_start'
+	});
 	ok @pushed.grep({ $_<params><data>.contains('pushed') }).elems > 0,
 		'and so did its output';
 	ok @pushed.all<params><data>.contains($id), 'Every pushed line names the job';

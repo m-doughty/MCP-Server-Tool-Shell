@@ -17,10 +17,12 @@ my $server = MCP::Server.new(:name<stdin-tests>);
 $server.plug: MCP::Server::Tool::Shell.new(allow => [$raku], timeout => 30);
 
 # Reports what it managed to read, giving up after a couple of seconds so a
-# stdin that is never closed cannot hang the test run.
+# stdin that is never closed cannot hang the test run.  A read that never
+# finished says so — "blocked" is a different answer from "end of file with
+# nothing in it", and the difference is exactly what terminal isolation is for.
 my constant PEEK = 'my $p = start { my $t = ""; try { $t = $*IN.slurp }; $t }; '
 	~ 'await Promise.anyof($p, Promise.in(2)); '
-	~ 'print "[" ~ ($p.status ~~ Kept ?? ($p.result // "") !! "") ~ "]"';
+	~ 'print "[" ~ ($p.status ~~ Kept ?? ($p.result // "") !! "blocked") ~ "]"';
 
 subtest 'Text on standard input reaches the command' => {
 	plan 4;
@@ -47,10 +49,12 @@ subtest 'An empty string is an immediate end of file' => {
 	ok $elapsed < 20, "and did not wait around ({$elapsed.round(0.01)}s)";
 };
 
-subtest 'Omitting stdin leaves it unconnected' => {
+subtest 'Omitting stdin gives the command end of file, not the host\'s input' => {
 	plan 5;
-	# The distinction that matters: a command we were not asked to write to is
-	# not written to, and does not receive an end of file we invented for it.
+	# The distinction that matters: a command we were not asked to write to
+	# reads nothing — and reads it immediately, rather than sitting on whatever
+	# the server process had on fd 0 waiting for a line that will never come.
+	# That is terminal isolation's half of standard input (see t/11).
 	my %sent = run-ok($server,
 		{ command => $raku, args => ['-e', PEEK], stdin => 'ping' },
 		'with stdin',
@@ -61,7 +65,8 @@ subtest 'Omitting stdin leaves it unconnected' => {
 		{ command => $raku, args => ['-e', PEEK] },
 		'without stdin',
 	);
-	is %absent<stdout>, '[]', 'A command started without stdin gets nothing from us';
+	is %absent<stdout>, '[]',
+		'A command started without stdin reads end of file, not a blocked pipe';
 	nok %absent<timed-out>, 'and the run is not held up by it';
 };
 

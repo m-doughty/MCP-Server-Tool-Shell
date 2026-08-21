@@ -2,6 +2,84 @@ Revision history for MCP::Server::Tool::Shell
 
 {{$NEXT}}
 
+0.4.0  2026-08-21T21:42:28+01:00
+    - The three introspection tools (allowed, poll, output) now declare the MCP
+      annotations readOnlyHint and idempotentHint: none of them starts, stops
+      or advances anything -- an output cursor is a position the caller holds,
+      and reading from one leaves the buffer as it was -- and the job registry
+      and output buffers carry their own locks, so a host may run a batch of
+      them side by side. run, start and kill declare nothing, deliberately: a
+      command is whatever the caller typed, start mints a job and kill ends
+      one.
+    - Background jobs now emit a structured "notifications/job" alongside the
+      prose lifecycle lines, on the same channel: params { job, state, exit,
+      runtime, command, logger }, with state "started", "exited" or "killed",
+      exit absent (rather than null) when no status ever arrived, and command a
+      120-character excerpt of the job's own record of what it was asked to
+      run. Exactly one start and one terminal event per job; a job that could
+      not be spawned emits only the terminal one, from inside the "start" call.
+      The prose lines are unchanged, so a client reading those reads exactly
+      what it always did.
+      Nothing the command writes is ever in a lifecycle event -- not its
+      output, not its arguments. These events are what a host is most likely to
+      render as trustworthy text, so a command that prints its own framing must
+      not get a hearing that way; output has the debug-level pushes and the
+      "output" tool.
+    - Terminal isolation: spawned commands are kept away from the terminal of
+      the process hosting the pack.  The pack can be plugged in-process (a
+      terminal application hosting its own tool server), where children would
+      otherwise inherit the host's controlling terminal — and one child that
+      restores cooked mode on exit is enough to leave the host drawing
+      perfectly and unable to read another keystroke.  Two mechanisms, applied
+      at BOTH spawn sites (foreground "run" and background "start"):
+      a run given no "stdin" argument now gets a closed pipe on fd 0 rather
+      than the host's standard input (every platform — in stdio server mode
+      that also stops a child eating the client's own JSON-RPC frames), and on
+      POSIX each child is put in a session of its own, so /dev/tty cannot reach
+      the host's terminal at all.
+    - The new session is made by a trampoline that calls setsid(2) and then
+      execs the command in the same process: perl by preference (present on
+      macOS and mainstream Linux, and the pack supplies the trampoline text, so
+      a command that cannot be exec'd still reports exit -1 with the reason on
+      stderr exactly as it always did), falling back to setsid(1) on images
+      without perl.  The mechanism is resolved and VERIFIED once per process;
+      a toolkit that asks for isolation and cannot get it fails to construct
+      rather than starting quietly unprotected.
+    - Unix kills now take the process tree.  A child in its own session leads
+      its own process group, so a timeout, a cancel or the "kill" tool signals
+      the group: grandchildren the command spawned no longer outlive it (and no
+      longer hold its pipes open long enough to lose the exit status).  This
+      closes the Unix half of what the previous release fixed for Windows.
+    - New "isolate-terminal" configuration key (default True, also settable
+      from a JSON config): turning it off restores the previous behaviour
+      exactly — children inherit standard input and the controlling terminal —
+      for a host with no terminal to protect, or a machine that can provide no
+      mechanism.
+    - New unit MCP::Server::Tool::Shell::Isolation, documenting the hazard and
+      the mechanism, and exporting the seams the pack uses.
+    - Fixed: the Windows tree-kill added in 0.3.0 passed Proc::Async.pid — a
+      Promise — to taskkill, so it stringified a Promise instead of a pid and
+      the tree was never walked.  Pids are now read (without blocking) through
+      a helper both kill paths share.
+
+0.3.0
+    - New "launcher" attribute: a duck-typed Callable given the validated plan
+      { command, argv, dir } just before the process is built, returning the
+      wrapped { command, argv } to exec in its place — the seam a host uses to
+      wrap a run in an OS sandbox (sandbox-exec, bwrap).  It wraps BOTH spawn
+      sites (foreground "run" and background "start"); an undefined launcher is
+      byte-for-byte the old behaviour; a launcher that throws (or returns an
+      unspawnable shape) is a failed spawn (exit -1, reason in stderr), never a
+      crash and never a fallback to the unwrapped command.  Programmatic only —
+      from-config does not offer it as a key.
+    - A launcher may return "sandboxed => True", which surfaces as
+      "sandbox => { active => true }" on the result (foreground "run", and a
+      job's "output"), so a host can tell a sandbox denial from an ordinary
+      non-zero exit.  Absent when there is no launcher.
+    - Windows: a kill (timeout, cancel, or the "kill" tool) now takes the whole
+      process tree via "taskkill /T /F /PID", so grandchildren no longer
+      outlive it.  Unix behaviour is unchanged (SIGKILL to the direct child).
+
 0.2.0  2026-08-09T20:02:19+01:00
     - Background jobs: new "start", "poll", "output" and "kill" tools run a
       command that outlives the tool call which started it.  Jobs are capped

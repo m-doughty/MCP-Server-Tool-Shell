@@ -3,6 +3,7 @@ use MCP::Server::Protocol;
 use MCP::Server::Toolkit;
 use MCP::Server::Tool::Shell::Buffer;
 use MCP::Server::Tool::Shell::Jobs;
+use MCP::Server::Tool::Shell::Isolation;
 
 #| A command runner for MCP::Server.  Commands are always spawned as an argv
 #| vector (never through a shell), output is captured into capped buffers, and
@@ -13,6 +14,12 @@ use MCP::Server::Tool::Shell::Jobs;
 #| (.allow), or .allow-any for deployments that gate consent somewhere else —
 #| an MCP::Client::Policy in front of the tools, or a human watching the
 #| session.  One or the other, never both, never neither.
+#|
+#| Commands are also kept away from the terminal the host process is attached
+#| to: standard input is detached unless the caller supplied some, and on POSIX
+#| every child runs in a session of its own, so nothing it does to a terminal
+#| can reach the host's.  See MCP::Server::Tool::Shell::Isolation and the
+#| .isolate-terminal attribute.
 unit class MCP::Server::Tool::Shell does MCP::Server::Toolkit;
 
 #| Exact argv0 strings that may be executed, e.g. <git rg /usr/bin/jq>.  The
@@ -30,6 +37,43 @@ has Bool:D $.allow-any = False;
 
 #| Default working directory for every run; the "cwd" argument overrides it.
 has IO::Path() $.cwd;
+
+#| An optional spawn launcher: a duck-typed C<Callable> given the validated
+#| plan C<< { command, argv, dir } >> just before the process is built, which
+#| returns the wrapped C<< { command, argv } >> to exec in its place (a sandbox
+#| wrapper such as C<sandbox-exec> or C<bwrap>, with the original command and
+#| its arguments folded onto the wrapper's own argv; C<dir> is left alone).  It
+#| may also return C<< sandboxed => True >>, which surfaces as
+#| C<< sandbox => { active => True } >> on the tool result so a host can tell a
+#| sandbox denial from an ordinary failure.  Undefined is the default and is
+#| byte-for-byte the old behaviour.  A launcher that throws (or returns a shape
+#| the pack cannot spawn) is reported as a failed spawn — exit C<-1>, the
+#| reason in stderr — never a crash.  See L<MCP::Server::Tool::Shell::Jobs>'
+#| C<apply-launcher>.
+#|
+#| Private (no accessor) on purpose: it is wiring rather than configuration —
+#| a C<Callable> cannot come from a JSON config, so C<from-config> must not
+#| offer it as a key — but C<is built> still lets C<.new(launcher => …)> set
+#| it, which is how a host application installs a sandbox wrapper.
+has &!launcher is built;
+
+#| Keep spawned commands away from the terminal this process is attached to.
+#| On by default, and you almost certainly want it on: a pack plugged into a
+#| terminal application shares that application's terminal with everything it
+#| runs, and one child that leaves the terminal in cooked mode on exit is
+#| enough to make the host unable to read another keystroke.
+#|
+#| Two things happen when it is on.  A run given no C<stdin> argument gets a
+#| closed pipe on C<fd 0> rather than the host's standard input (every
+#| platform), and on POSIX the child is put in a session of its own, so
+#| C</dev/tty> cannot reach the host's terminal and a kill takes the child's
+#| whole process group.  Turning it off restores the previous behaviour
+#| exactly: children inherit standard input and the controlling terminal.
+#|
+#| Constructing the toolkit fails loudly if isolation is asked for and no
+#| mechanism can be found and verified, rather than starting with the
+#| protection quietly missing.  See L<MCP::Server::Tool::Shell::Isolation>.
+has Bool:D $.isolate-terminal = True;
 
 #| Wall-clock budget, in seconds, for a single foreground run.  The "timeout"
 #| argument overrides it per call; background jobs have no default budget.
@@ -70,6 +114,31 @@ my constant NOTIFY-BATCH-BYTES = 32768;
 my constant MIN-OUTPUT-BYTES = 1024;
 my constant MIN-OUTPUT-LINES = 10;
 
+#| The MCP annotations the three B<introspection> tools carry: "allowed", which
+#| reads a list this instance was built with, and "poll" and "output", which
+#| read a job's state and a window of what it has already written.  None of
+#| them starts, stops or advances anything: an "output" cursor is a position
+#| the CALLER holds, and reading from one leaves the buffer exactly as it was,
+#| so the same call twice is the same answer twice.
+#|
+#| Concurrency-safe as well as read-only, which is the other half of what these
+#| hints promise: the job registry and every job's output buffer take their own
+#| locks (see MCP::Server::Tool::Shell::Jobs and ::Buffer), so two of these
+#| running side by side see coherent state rather than a half-written flush.
+#|
+#| B<"run", "start" and "kill" carry none, deliberately.>  A command is
+#| whatever the model typed — the pack cannot know whether it writes — "start"
+#| mints a job, and "kill" ends one.  Annotating them would be telling a host
+#| it may run two of them at once, which is exactly the thing the caller must
+#| decide for itself.
+#|
+#| A C<Map> rather than a Hash literal: `constant %h = {...}` freezes the
+#| container and not the object inside it.
+my constant READ-ANNOTATIONS = Map.new((
+	readOnlyHint   => True,
+	idempotentHint => True,
+));
+
 # The servers this kit has been plugged into, for pushing job output out of
 # band.  Private (no accessor) on purpose: it is wiring rather than
 # configuration, and from-config validates against the public attributes.
@@ -83,6 +152,12 @@ has Str:D $!run-logger = 'run';
 has Str:D $!job-logger = 'start';
 
 has $!jobs;
+
+# How children are kept away from the host's terminal, resolved once per
+# process (see MCP::Server::Tool::Shell::Isolation) and consulted at both spawn
+# sites.  Private: it is the outcome of a decision, not the decision itself,
+# which is the public isolate-terminal attribute.
+has $!isolation;
 
 submethod TWEAK {
 	# One gate or the other.  Setting both asks two contradictory questions of
@@ -114,6 +189,12 @@ submethod TWEAK {
 	die "Shell toolkit max-output-lines must be at least {MIN-OUTPUT-LINES}, got {$!max-output-lines}"
 		unless $!max-output-lines >= MIN-OUTPUT-LINES;
 
+	# Resolved here rather than at the first spawn: a host that cannot isolate
+	# its children should find out while it is wiring itself up, not from the
+	# first tool call an agent makes.  The answer is memoised process-wide, so
+	# the second toolkit costs nothing.
+	$!isolation = $!isolate-terminal ?? resolve-isolation() !! isolation-off();
+
 	# The registry validates max-jobs / max-finished-jobs / job-ttl, so those
 	# rules live in one place and a directly-built Registry gets them too.
 	$!jobs = MCP::Server::Tool::Shell::Jobs::Registry.new(
@@ -137,6 +218,7 @@ method register($registrar) {
 	$!job-logger = $registrar.?prefixed('start') // 'start';
 
 	$registrar.tool: 'allowed',
+		annotations => READ-ANNOTATIONS,
 		description => $!allow-any
 			?? 'Report which commands this shell toolkit may run.  This one has no '
 			  ~ 'allow list: any command the server user can execute is available.'
@@ -168,6 +250,7 @@ method register($registrar) {
 		handler => -> :%args { self!start(%args) };
 
 	$registrar.tool: 'poll',
+		annotations => READ-ANNOTATIONS,
 		description => 'Report the state of a background job as a JSON object: '
 		  ~ 'state (running, exited or killed), exit status once there is one, '
 		  ~ 'timed-out, killed, started-at, runtime in seconds, and how many bytes '
@@ -177,6 +260,7 @@ method register($registrar) {
 		handler => -> :%args { self!poll(%args) };
 
 	$registrar.tool: 'output',
+		annotations => READ-ANNOTATIONS,
 		description => 'Return a background job\'s output as a JSON object with the '
 		  ~ 'keys job, state, stdout, stderr, cursor and eof.  Called without a '
 		  ~ 'cursor it returns a capped snapshot of the whole run so far; called '
@@ -230,7 +314,8 @@ method !run-params(Str:D $what --> Hash) {
 			type => 'string',
 			description => 'Text written to the command\'s standard input, which is '
 			  ~ 'then closed.  An empty string means "no input, EOF immediately".  '
-			  ~ 'Omit it entirely to leave standard input unconnected.',
+			  ~ 'Omit it entirely and the command reads end of file straight '
+			  ~ 'away: a command never inherits the server\'s own standard input.',
 		},
 		timeout => {
 			type => 'number',
@@ -289,6 +374,14 @@ method !start(%args --> Str:D) {
 		?? -> Str:D $level, Str:D $line { self!push($level, $line) }
 		!! Callable;
 
+	# The lifecycle channel goes to the same servers, and is wired on the same
+	# condition.  Separate from the output one because they are read by
+	# different sorts of consumer: a log window takes the lines, a host that
+	# does something when a build finishes takes the events.
+	my &notify-event = @!servers.elems > 0
+		?? -> %params { self!push-event(%params) }
+		!! Callable;
+
 	# Bound to a variable of its own rather than passed straight out of the
 	# hash: a list living in a hash value is itemised, and would arrive as one
 	# argument that happens to be an array.
@@ -305,6 +398,9 @@ method !start(%args --> Str:D) {
 			stdout => @streams[0],
 			stderr => @streams[1],
 			:&notify,
+			:&notify-event,
+			launcher => &!launcher,
+			isolation => $!isolation,
 			on-finish => { Promise.in($!job-ttl).then({ $!jobs.reap }) },
 		)
 	});
@@ -353,6 +449,11 @@ method !output(%args --> Str:D) {
 
 	my %truncated = self!truncation(%out, %err);
 	%payload<truncated> = %truncated if %truncated.elems > 0;
+
+	# The sandbox marker, present only for a job a launcher actually wrapped —
+	# the "output" tool is where a job's result is read, so it is where A7
+	# looks to tell a sandbox denial from an ordinary failure.
+	%payload<sandbox> = { active => True } if $job.sandboxed;
 
 	to-json(%payload, :!pretty, :sorted-keys);
 }
@@ -489,13 +590,42 @@ method !execute(%plan, Real:D $timeout --> Str:D) {
 	my $pending-lock = Lock.new;
 	my %pending;
 
+	# The sandbox/launcher wrapper, applied right before the process is built.
+	# A launcher that throws (or hands back an unspawnable shape) is a failed
+	# spawn, not a crash: it lands in the same exit -1 + stderr payload a
+	# Proc::Async that could not start does, computed here without ever
+	# reaching the process.
+	my %launch;
+	my $launch-error;
+	{
+		CATCH { default { $launch-error = .message } }
+		%launch = apply-launcher(&!launcher, %plan<command>, %plan<argv>.list, %plan<dir>);
+	}
+	with $launch-error {
+		$err.add($_);
+		my %fail = $err.snapshot;
+		return to-json(
+			{ exit => -1, stdout => '', stderr => %fail<text>, 'timed-out' => False },
+			:!pretty, :sorted-keys,
+		);
+	}
+
+	# Terminal isolation goes on OUTSIDE the launcher's wrapper, so the exec
+	# chain is trampoline -> sandbox wrapper -> command: a sandbox profile never
+	# has to permit the trampoline, and the run is detached from the host's
+	# terminal whether or not the host installed a launcher at all.
+	my %spawn = $!isolation.wrap(%launch<command>, %launch<argv>.list);
+
 	my $stdin = %plan<stdin>;
-	# :w only when there is something to write: an open pipe nobody writes to
-	# is not the same as an unconnected standard input, and a run that passes
-	# no stdin must behave exactly as it did before stdin existed.
-	my $proc = $stdin.defined
-		?? Proc::Async.new(:w, %plan<command>, |%plan<argv>)
-		!! Proc::Async.new(%plan<command>, |%plan<argv>);
+	# :w when there is something to write, and also when the isolation is
+	# detaching standard input -- in which case the pipe is closed the moment
+	# the process starts, so the child reads end of file instead of whatever
+	# the host had on fd 0 (a terminal, or the stdio transport carrying the
+	# client's own requests).  Without either, fd 0 is left exactly as it was.
+	my Bool:D $pipe-stdin = $stdin.defined || $!isolation.detach-stdin;
+	my $proc = $pipe-stdin
+		?? Proc::Async.new(:w, %spawn<command>, |%spawn<argv>)
+		!! Proc::Async.new(%spawn<command>, |%spawn<argv>);
 
 	# The quit handlers are load-bearing: when the spawn itself fails both output
 	# supplies quit with the spawn exception, and an unhandled quit runs on a
@@ -529,6 +659,12 @@ method !execute(%plan, Real:D $timeout --> Str:D) {
 		# condition rather than a caller error.
 		my $feed = $_;
 		start { try await $proc.print($feed); try $proc.close-stdin }
+	}
+	elsif $pipe-stdin {
+		# Nothing to write, so the write end goes at once: the child's fd 0 is a
+		# pipe at end of file, which is what "no standard input" has to mean for
+		# a pack that may be hosted inside a terminal application.
+		try $proc.close-stdin;
 	}
 
 	my $deadline = now + $timeout;
@@ -564,8 +700,12 @@ method !execute(%plan, Real:D $timeout --> Str:D) {
 		# .kill after the first on a given Proc::Async, so a catchable signal
 		# first would leave no way to escalate against a child that traps it.
 		# SIGKILL is also the portable choice — on Windows it is one of the three
-		# signals libuv maps onto TerminateProcess.
-		try $proc.kill(Signal::SIGKILL);
+		# signals libuv maps onto TerminateProcess.  The whole tree goes with it
+		# (kill-process-tree): on Windows always, and on POSIX whenever the run
+		# was given a session (and so a process group) of its own.
+		# Grandchildren the command spawned would otherwise outlive the timeout
+		# and hold its pipes open.
+		kill-process-tree($proc, group => $!isolation.new-session);
 		await Promise.anyof($done, Promise.in(KILL-GRACE));
 	}
 
@@ -582,6 +722,13 @@ method !execute(%plan, Real:D $timeout --> Str:D) {
 	my %out = $out.snapshot;
 	my %err = $err.snapshot;
 
+	# A trampoline that could not exec the command has already replaced the
+	# process, so the failure arrives as an ordinary exit rather than as a
+	# broken start promise.  This maps it back onto the exit -1 the payload has
+	# always used for "could not be spawned at all", so terminal isolation does
+	# not change what a caller reads for a missing binary.
+	$exit = $!isolation.normalize-exit($exit, { %err<text> });
+
 	my %payload =
 		exit => $exit,
 		stdout => %out<text>,
@@ -590,6 +737,12 @@ method !execute(%plan, Real:D $timeout --> Str:D) {
 
 	my %truncated = self!truncation(%out, %err);
 	%payload<truncated> = %truncated if %truncated.elems > 0;
+
+	# The sandbox marker, present only when a launcher actually wrapped this
+	# run: A7 reads it to tell a sandbox denial from an ordinary non-zero exit.
+	# Absent entirely otherwise, so a run with no launcher keeps the exact
+	# payload it always had.
+	%payload<sandbox> = { active => True } if %launch<sandboxed>;
 
 	to-json(%payload, :!pretty, :sorted-keys);
 }
@@ -621,14 +774,39 @@ method !flush($ctx, $pending-lock, %pending --> Nil) {
 # A background job's push channel.  MCP::Server.notify is era-aware and
 # echo-free; called from a flusher thread there is no request context, so it
 # takes the legacy path and delivers on an initialized legacy stdio session's
-# transport-wide channel.  A modern (Streamable HTTP) session has no
-# server-initiated stream between requests, so it answers False and nothing is
-# delivered — which is why "poll" and "output" exist and are documented as the
-# reliable way to follow a job.
+# transport-wide channel, and on the host's own :on-notify sink if the server
+# was built with one.  A modern (Streamable HTTP) session has neither — there
+# is no server-initiated stream between requests — so it answers False and
+# nothing is delivered, which is why "poll" and "output" exist and are
+# documented as the reliable way to follow a job.
 method !push(Str:D $level, Str:D $line --> Nil) {
 	my %notif = notification('notifications/message', {
 		level => $level, logger => $!job-logger, data => $line,
 	});
+	for @!servers -> $server {
+		try $server.notify(%notif);
+	}
+}
+
+# A job's lifecycle events: the same channel and the same delivery caveats as
+# !push, a different method so a consumer can subscribe to "a job started or
+# finished" without parsing prose out of a log stream.  The logger is the
+# prefixed tool name, as on every other notification this pack emits, so a host
+# with two shell kits plugged into one server can tell them apart.
+#
+# Params are the job's own facts and only those: id, state, exit, runtime and a
+# bounded excerpt of the command.  Nothing the child wrote is ever in here (see
+# command-excerpt in Jobs) — this is the channel a host is most likely to turn
+# into something a model reads, so it is the one that must not carry text the
+# command chose.
+method !push-event(%params --> Nil) {
+	# Copied rather than composed with a slip: a hash composer that opens with
+	# |%params parses as a block, and the job's own shielding would swallow the
+	# type error that follows.  Copied also because the hash belongs to the job.
+	my %payload = %params;
+	%payload<logger> = $!job-logger;
+
+	my %notif = notification('notifications/job', %payload);
 	for @!servers -> $server {
 		try $server.notify(%notif);
 	}
