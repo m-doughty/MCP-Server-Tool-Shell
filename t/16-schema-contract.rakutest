@@ -1,0 +1,190 @@
+use Test;
+use MCP::Server::Tool::Shell::Test::Kit;
+use JSON::Fast;
+use MCP::Server;
+use MCP::Server::Tool::Shell;
+
+# What each tool publishes about its own arguments, checked against what its
+# handler actually does with them.
+#
+# The parameter a model omits here is "args", and the cost of omitting it is
+# not an error: it is a command run with no arguments at all, which looks like
+# a working call that did the wrong thing. So the schema says both halves out
+# loud -- "command" is required, and omitting "args" means an empty argv vector
+# -- and every claim below is checked against the handler rather than against
+# the registration.
+
+plan 6;
+
+my $raku = raku-path();
+
+sub shell-server(*%config --> MCP::Server:D) {
+	my $server = MCP::Server.new(:name<shell-schema>);
+	$server.plug: MCP::Server::Tool::Shell.new(allow => [$raku], |%config);
+	$server;
+}
+
+my $server = shell-server();
+
+# One row per tool: what the schema must say, a valid call to perturb, and the
+# refusal a missing required argument earns.
+my @contracts = (
+	%(
+		tool     => 'sh_allowed',
+		required => ().List,
+		defaults => %(),
+		args     => %(),
+		missing  => '',
+	),
+	%(
+		tool     => 'sh_run',
+		required => <command>.List,
+		defaults => %( args => [], timeout => 30 ),
+		args     => %( command => $raku, args => ['-e', 'print "hi"'] ),
+		missing  => "'command' is required",
+	),
+	%(
+		tool     => 'sh_start',
+		required => <command>.List,
+		defaults => %( args => [] ),
+		args     => %( command => $raku, args => ['-e', 'print "hi"'] ),
+		missing  => "'command' is required",
+	),
+	%(
+		tool     => 'sh_poll',
+		required => <job>.List,
+		defaults => %(),
+		args     => %( job => 'job-1' ),
+		missing  => "'job' is required",
+	),
+	%(
+		tool     => 'sh_output',
+		required => <job>.List,
+		defaults => %(),
+		args     => %( job => 'job-1' ),
+		missing  => "'job' is required",
+	),
+	%(
+		tool     => 'sh_kill',
+		required => <job>.List,
+		defaults => %(),
+		args     => %( job => 'job-1' ),
+		missing  => "'job' is required",
+	),
+);
+
+subtest 'the schema names exactly the required parameters' => {
+	plan @contracts.elems + 1;
+
+	is-deeply @contracts.map(*<tool>).sort.List, tool-names($server),
+		'the table covers every tool the pack publishes';
+
+	for @contracts -> %contract {
+		my %schema = tool-schema($server, %contract<tool>);
+		is-deeply (%schema<required> // ()).sort.List, %contract<required>.sort.List,
+			"{%contract<tool>} requires {%contract<required>.elems ?? %contract<required>.join(', ') !! 'nothing'}";
+	}
+};
+
+subtest 'the schema advertises exactly the declared defaults' => {
+	plan @contracts.elems;
+
+	for @contracts -> %contract {
+		my %props = tool-schema($server, %contract<tool>)<properties> // %();
+		my %declared = %props.kv.map(-> $name, %prop {
+			%prop<default>:exists ?? ($name => %prop<default>) !! ()
+		}).flat.Hash;
+		is-deeply %declared, %contract<defaults>.Hash,
+			"{%contract<tool>} publishes the defaults its handler applies";
+	}
+};
+
+subtest 'a required parameter really is required' => {
+	plan @contracts.map({ .<required>.elems }).sum;
+
+	# The assertion this file exists for: a parameter the handler refuses to
+	# work without has to be named in the schema, because the schema is the
+	# only place a model can find that out before it calls.  Nothing here
+	# spawns a process: every refusal happens in validation.
+	for @contracts -> %contract {
+		for %contract<required>.list -> $name {
+			my %args = %contract<args>.Hash;
+			%args{$name}:delete;
+			errors-with $server, %contract<tool>, %args, %contract<missing>,
+				"{%contract<tool>} without $name is refused, not guessed at";
+		}
+	}
+};
+
+subtest 'omitting args is exactly an empty argv vector' => {
+	plan 2;
+
+	# Both calls run the interpreter with no arguments at all, which is what
+	# the declared default says omitting "args" means.  If the pack ever
+	# started filling something in, these two would stop agreeing.
+	my %omitted  = call($server, 'sh_run', %( command => $raku ))<result>;
+	my %explicit = call($server, 'sh_run', %( command => $raku, args => [] ))<result>;
+
+	my $same = (%omitted<isError> // False) eqv (%explicit<isError> // False)
+		&& %omitted<content> eqv %explicit<content>;
+	ok $same, 'a run with no args matches a run with args => []';
+	diag "omitted: {%omitted.raku}\nexplicit: {%explicit.raku}" unless $same;
+
+	is-deeply tool-schema($server, 'sh_start')<properties><args><default>,
+		tool-schema($server, 'sh_run')<properties><args><default>,
+		'and "start" publishes the same default, from the same parameter block';
+};
+
+subtest 'the timeout a run falls back to is the one published' => {
+	plan 3;
+
+	# The default here is this toolkit's own budget rather than a constant of
+	# the tool, so the schema is built from the instance -- and a toolkit built
+	# with a different budget has to publish that one.
+	my $brisk = shell-server(timeout => 0.5);
+	is tool-schema($brisk, 'sh_run')<properties><timeout><default>, 0.5,
+		'a toolkit with a half-second budget says so in its schema';
+	is tool-schema($server, 'sh_run')<properties><timeout><default>, 30,
+		'and the default-configured one publishes the default budget';
+
+	my $started = now;
+	my %got = from-json(text(call($brisk, 'sh_run',
+		%( command => $raku, args => ['-e', 'sleep 30'] ))));
+	my $elapsed = now - $started;
+	ok %got<timed-out> && $elapsed < 15,
+		"a run naming no timeout really is killed at the published budget "
+		~ "({$elapsed.round(0.01)}s)";
+};
+
+subtest 'the parameters that declare no default apply none' => {
+	plan 5;
+
+	my $brisk = shell-server(timeout => 0.5);
+	my %run-props = tool-schema($brisk, 'sh_run')<properties>;
+
+	# "cwd" runs in the toolkit's configured directory, or the server
+	# process's own when it has none: a fact about the deployment rather than
+	# about the tool, and not something to publish to a model by accident.
+	nok %run-props<cwd><default>:exists, 'cwd declares no default';
+	# Omitted "stdin" is not an empty string being substituted -- the command
+	# is given a closed pipe and reads end of file straight away.
+	nok %run-props<stdin><default>:exists, 'stdin declares no default';
+	nok tool-schema($brisk, 'sh_output')<properties><cursor><default>:exists,
+		'and an omitted cursor is a snapshot request, not a value';
+
+	# A background job with no timeout runs until it finishes or is killed,
+	# which is why "start" publishes no budget even on a toolkit whose
+	# foreground runs are killed at half a second.
+	nok tool-schema($brisk, 'sh_start')<properties><timeout><default>:exists,
+		'start publishes no timeout default';
+
+	my %job = from-json(text(call($brisk, 'sh_start',
+		%( command => $raku, args => ['-e', 'sleep 30'] ))));
+	LEAVE call($brisk, 'sh_kill', %( job => %job<job> )) if %job<job>;
+
+	# Well past the foreground budget: a job that inherited it would be gone.
+	sleep 2;
+	my %status = from-json(text(call($brisk, 'sh_poll', %( job => %job<job> ))));
+	is %status<state>, 'running',
+		'and a job that names none is not killed at the foreground budget';
+};

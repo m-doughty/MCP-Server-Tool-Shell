@@ -15,6 +15,13 @@ use MCP::Server::Tool::Shell::Isolation;
 #| an MCP::Client::Policy in front of the tools, or a human watching the
 #| session.  One or the other, never both, never neither.
 #|
+#| The "command" argument is one executable and nothing else.  A command line
+#| in that argument — "prove6 --help" — is refused with an error that shows
+#| the corrected call, rather than spawned as a request for a program with a
+#| space in its name (whose failure reads exactly like a missing binary, and
+#| has cost real sessions hours).  The rule is written out above
+#| check-command-shape and in this dist's Pod.
+#|
 #| Commands are also kept away from the terminal the host process is attached
 #| to: standard input is detached unless the caller supplied some, and on POSIX
 #| every child runs in a session of its own, so nothing it does to a terminal
@@ -231,11 +238,13 @@ method register($registrar) {
 		  ~ 'stdout, stderr and timed-out.  Arguments are passed straight to the '
 		  ~ 'program as an argv vector: there is no shell, so no quoting, '
 		  ~ 'globbing, redirection, pipes or variable interpolation happen.  '
+		  ~ 'Put the executable in "command" and every argument in "args" — a '
+		  ~ '"command" that is a whole command line is refused, not run.  '
 		  ~ 'Output is capped: when a run produces more than the server keeps, '
 		  ~ 'the middle is dropped and a "truncated" key says how much.  Use the '
 		  ~ 'companion "start" tool instead for work that will outlast a single '
 		  ~ 'tool call, and "allowed" to see which commands are available.',
-		params => self!run-params('this run'),
+		params => self!run-params('this run', timeout-default => $!timeout),
 		handler => -> :%args { self!run(%args) };
 
 	$registrar.tool: 'start',
@@ -245,7 +254,9 @@ method register($registrar) {
 		  ~ 'The command keeps running after this call answers; "poll" reports how '
 		  ~ 'it is getting on, "output" returns what it has written, and "kill" '
 		  ~ 'stops it.  Arguments are an argv vector exactly as for "run" — there '
-		  ~ 'is still no shell.',
+		  ~ 'is still no shell, the executable goes in "command" and every '
+		  ~ 'argument in "args", and a "command" that is a whole command line is '
+		  ~ 'refused, not run.',
 		params => self!run-params('this job'),
 		handler => -> :%args { self!start(%args) };
 
@@ -288,22 +299,38 @@ method register($registrar) {
 }
 
 # The parameter block "run" and "start" share.  $what names the call in the
-# descriptions so neither tool talks about the other's lifetime.
-method !run-params(Str:D $what --> Hash) {
-	{
+# descriptions so neither tool talks about the other's lifetime, and
+# $timeout-default is the budget this toolkit applies to a call that names
+# none: a foreground run has one, a background job does not, so only "run"
+# passes it.
+method !run-params(Str:D $what, Real :$timeout-default --> Hash) {
+	my %params =
 		command => {
 			type => 'string',
-			description => $!allow-any
-				?? 'Command to run.  Any executable the server user can run is allowed.'
-				!! 'Command to run.  Must match one of the allowlisted strings '
-				  ~ 'exactly (see the "allowed" tool).',
+			description => 'The name or path of ONE executable, and nothing else: '
+			  ~ 'there is no shell here, so a command line is refused rather than '
+			  ~ 'run.  Arguments go in "args": {"command": "git", "args": '
+			  ~ '["status", "-s"]}, never {"command": "git status -s"}.  '
+			  ~ ($!allow-any
+					?? 'Any executable the server user can run is allowed.'
+					!! 'Must match one of the allowlisted strings exactly (see the '
+					  ~ '"allowed" tool).'),
 			required => True,
 		},
 		args => {
 			type => 'array',
-			description => 'Arguments passed to the command, one array entry per '
-			  ~ 'argument.  Entries are strings; an entry containing spaces stays '
-			  ~ 'a single argument.',
+			description => 'Every argument to the command, one array entry per '
+			  ~ 'argument: "git status -s" is ["status", "-s"].  This is where '
+			  ~ 'arguments belong — never appended to "command" — because the '
+			  ~ 'program is spawned as an argv vector with no shell in the way.  '
+			  ~ 'Entries are strings and reach the program untouched: an entry '
+			  ~ 'containing spaces stays a single argument, and nothing is '
+			  ~ 'quoted, split or expanded.',
+			# Omitting it runs the command with no arguments at all, which is
+			# what an empty argv vector means -- published so that a model
+			# reading this schema can see it is a real choice rather than a
+			# gap the server will fill in from somewhere.
+			default => [],
 		},
 		cwd => {
 			type => 'string',
@@ -324,8 +351,21 @@ method !run-params(Str:D $what --> Hash) {
 				  ~ 'until it finishes or is killed.'
 				!! 'Seconds to wait before killing the command, overriding the '
 				  ~ 'server default for this call.',
-		},
-	}
+		};
+
+	# A foreground run that names no timeout gets this toolkit's own budget, so
+	# the schema can say what it is.  A background job that names none runs
+	# until it finishes or is killed, which is an absence rather than a value:
+	# nothing to advertise.
+	#
+	# "cwd" is deliberately not given one.  A call that omits it runs in this
+	# toolkit's configured directory, or the server process's own when it has
+	# none -- a fact about the deployment rather than about the tool, and
+	# publishing a filesystem path to the model is not this pack's decision to
+	# take by accident.
+	%params<timeout><default> = $timeout-default if $timeout-default.defined;
+
+	%params;
 }
 
 method !job-param(--> Hash) {
@@ -482,6 +522,12 @@ method !validate(%args --> Hash) {
 	# program that ran would not be the program that was checked.
 	die "'command' must not contain NUL bytes" if $command.contains("\0");
 
+	# Before the allow list, deliberately: a "command" that is really a command
+	# line is the wrong shape whoever is allowed to run what, and in allow-any
+	# mode there is no allow list to catch it.  Both tools reach this method,
+	# so this is the one place the shape is decided.
+	check-command-shape($command);
+
 	die "Command '$command' is not allowlisted. Allowed: {@!allow.sort.join(', ')}"
 		unless $!allow-any || so @!allow.any eq $command;
 
@@ -527,6 +573,195 @@ method !argv($raw --> List) {
 	}
 
 	@argv.List;
+}
+
+# === "command" is one executable, not a command line ===
+#
+# A model that sends {"command": "prove6 --help"} has asked for a program
+# literally named "prove6 --help", and the spawn failure that comes back --
+# "no such file or directory" -- reads like a missing binary rather than a
+# misunderstood contract.  Seen from the other end that is hours of a session
+# spent hunting for binaries that were there all along, so the call is refused
+# here with an error that teaches the right one instead.
+#
+# THE RULE, in full.  A command is refused when it cannot be resolved to an
+# executable AND it looks like a command line rather than a program name,
+# which means either
+#
+#   * it contains one of the shell metacharacters below -- none of which a
+#     shell-free spawn can act on -- or
+#   * it contains whitespace and its first whitespace-delimited word IS an
+#     executable, so the call can be corrected exactly, by name.
+#
+# Resolution comes first in both arms because a path may contain anything the
+# filesystem allows: /Applications/My App/bin/tool runs, and so does
+# C:\Program Files (x86)\Git\cmd\git.exe, parentheses and all.  And a spacey
+# path to something that is simply not there -- a typo, a build artefact that
+# was never produced -- is left alone, so it still comes back as the ordinary
+# "could not be spawned" payload rather than being mislabelled a shape error.
+#
+# Nothing here ever splits a command and runs the pieces.  Auto-splitting
+# would put back the quoting ambiguity an argv vector exists to remove, and a
+# client-side policy's argument-aware rules match on argv, so a shell string
+# smuggled through as one command would slip past them.
+my constant SHELL-METACHARS = ('|', '&', ';', '<', '>', '(', ')', '$', '`', "\n", "\r");
+
+# Longest corrected call the error message will quote before it says the same
+# thing in the abstract instead.
+my constant SUGGESTION-BUDGET = 400;
+
+#| Refuse a "command" that is a command line rather than one executable,
+#| before anything is spawned.  Returning quietly means the call is the right
+#| shape, or is a claim about the filesystem this pack cannot second-guess.
+sub check-command-shape(Str:D $command --> Nil) {
+	my $meta = SHELL-METACHARS.first({ $command.contains($_) });
+	my Bool:D $spacey = so $command ~~ /\s/;
+
+	# The ordinary call: a bare program name or a plain path.  Decided without
+	# touching the filesystem at all.
+	return unless $meta.defined || $spacey;
+
+	# Whatever it looks like, a string that names a real executable names the
+	# program the caller meant.
+	return if names-executable($command);
+
+	my Str @words = $command.words;
+	my $program = @words.head;
+
+	# Whitespace on its own is only a suspicion; it is confirmed by finding
+	# the program that was buried in the string.  "git " (a stray trailing
+	# space) is caught here too, which is why the test is "differs from the
+	# whole string" rather than "there are two or more words".
+	my Bool:D $buried = $program.defined
+		&& $program ne $command
+		&& names-executable($program);
+	return unless $meta.defined || $buried;
+
+	die command-shape-error($command, $meta, @words);
+}
+
+#| The error a refused command line answers with: the contract, what was
+#| wrong with this particular call, and the same call written correctly.  The
+#| correction is derived by splitting on whitespace -- for the message only.
+sub command-shape-error(Str:D $command, $meta, @words --> Str:D) {
+	my Str $lead = "'command' takes the name or path of ONE executable: this "
+	  ~ 'tool spawns an argv vector with no shell, so arguments belong in '
+	  ~ "'args', never in 'command'.";
+
+	my Str $got = "Got '{one-line($command)}', which is not a program on this "
+	  ~ 'system';
+
+	my Str $fix = @words.elems > 1
+		?? "Write the call as {argv-suggestion(@words)} instead."
+		!! "Put the program's own name or path in 'command' and each of its "
+		  ~ "arguments in its own entry of 'args'.";
+
+	unless $meta.defined {
+		return "$lead  $got, but '{@words[0]}' is.  $fix";
+	}
+
+	"$lead  $got, and it contains {metachar-display($meta)}: there are no "
+	  ~ 'pipes, no redirection, no variable expansion, no globbing and no '
+	  ~ "command sequencing on this path.  $fix  To run a shell script, make "
+	  ~ "the shell itself the 'command' and pass the whole script as a single "
+	  ~ "entry in 'args'.";
+}
+
+#| The corrected call as JSON a client can copy: the first word as the
+#| command, every other word as its own argument.
+sub argv-suggestion(@words --> Str:D) {
+	my Str $command = to-json(@words[0], :!pretty);
+	my Str $suggestion = '{"command": ' ~ $command ~ ', "args": ['
+	  ~ @words.skip.map({ to-json($_, :!pretty) }).join(', ') ~ ']}';
+
+	$suggestion.chars <= SUGGESTION-BUDGET
+		?? $suggestion
+		!! '{"command": ' ~ $command ~ ', "args": [ … one entry per argument … ]}';
+}
+
+#| How a metacharacter is named in the message: the ones with no printable
+#| shape are described rather than quoted.
+sub metachar-display(Str:D $char --> Str:D) {
+	given $char {
+		when "\n" { 'a newline' }
+		when "\r" { 'a carriage return' }
+		default   { "the shell metacharacter '$char'" }
+	}
+}
+
+#| The caller's own string as a single bounded line: it is quoted back inside
+#| an error a model reads, and neither a newline nor a hundred-kilobyte script
+#| may turn that message into a mess.
+sub one-line(Str:D $text --> Str:D) {
+	my Str $flat = $text.subst("\n", '\n', :g)
+		.subst("\r", '\r', :g)
+		.subst("\t", '\t', :g);
+	$flat.chars > 160 ?? $flat.substr(0, 160) ~ '…' !! $flat;
+}
+
+#| Does this exact string name a program this pack could spawn?  Asked only
+#| of a command that already looks like a command line, so an ordinary call
+#| never pays for it.
+sub names-executable(Str:D $command --> Bool:D) {
+	return False unless $command.chars > 0;
+	my Bool:D $win = so $*DISTRO.is-win;
+
+	# Anything with a path separator in it is a path and is not looked for on
+	# PATH -- which is how exec reads it on both platforms.  On Windows that
+	# means a backslash or a drive letter as well as a slash.
+	return executable-file($command.IO)
+		if $command.contains('/')
+		|| ($win && ($command.contains('\\') || $command ~~ / ^ <[A..Za..z]> ':' /));
+
+	my @exts = $win ?? windows-path-exts() !! ();
+	for (env-value('PATH') // '').split($win ?? ';' !! ':', :skip-empty) -> $dir {
+		next unless $dir.chars > 0;
+		my $candidate = $dir.IO.add($command);
+		return True if executable-file($candidate);
+		return True if @exts.first({ executable-file(($candidate.Str ~ $_).IO) }).defined;
+	}
+
+	False;
+}
+
+#| An environment variable as the operating system reads it.  Windows names
+#| are case-insensitive and a process is handed PATH spelt "Path", but %*ENV
+#| is an ordinary case-sensitive Hash, so on Windows the name is matched
+#| without regard to case.  POSIX names are exact.
+#|
+#| An environment can still carry two spellings at once -- an MSYS or Cygwin
+#| parent hands over both PATH and Path -- and a Hash has no order to pick
+#| between them by.  The answer is fixed instead: the exact spelling asked
+#| for when there is one, otherwise the first case-insensitive match in
+#| sorted order, so the same environment always gives the same value.
+#| Exposed with C<our> scope for the tests — not part of the public API.
+our sub env-value(Str:D $name --> Str) {
+	return %*ENV{$name} // Str unless $*DISTRO.is-win;
+	return %*ENV{$name} if %*ENV{$name}:exists;
+	my $key = %*ENV.keys.grep({ .fc eq $name.fc }).sort.head;
+	$key.defined ?? %*ENV{$key} !! Str;
+}
+
+#| Can this path be exec'd?  POSIX asks the filesystem for the execute bit.
+#| Windows has no such bit -- CreateProcess decides from the file itself, and
+#| its refusal is an ordinary spawn failure -- so there the question is only
+#| whether the file is there.  A path the platform will not even stat (an
+#| illegal Windows filename, say) is not an executable, and must not throw out
+#| of a question asked while building an error message.
+sub executable-file(IO::Path:D $path --> Bool:D) {
+	my $answer = try so $path.f && ($*DISTRO.is-win || $path.x);
+	$answer // False;
+}
+
+#| The extensions Windows appends to a bare name looked up on PATH; the
+#| fallback is what the command processor itself starts from when PATHEXT is
+#| not set.
+sub windows-path-exts(--> List) {
+	(env-value('PATHEXT') // '.COM;.EXE;.BAT;.CMD')
+		.split(';', :skip-empty)
+		.map(*.trim)
+		.grep(*.chars > 0)
+		.List;
 }
 
 #| The budget for this call: the "timeout" argument when there is one, the

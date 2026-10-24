@@ -2,6 +2,96 @@ Revision history for MCP::Server::Tool::Shell
 
 {{$NEXT}}
 
+0.4.2  2026-10-24T18:52:13+01:00
+    - [2026-10-24] BUGFIX: on Rakudo 2026.09 under macOS, the pack leaked a
+      file descriptor every time it asked which platform it was on -- once
+      per PATH entry for every command line it refused, and once for every
+      environment lookup, isolation lookup and kill -- so a long-running
+      host at macOS's default limit of 256 descriptors could soon spawn
+      nothing at all. That Rakudo builds $*DISTRO afresh on every read, and
+      on macOS each build leaves a pipe open. The pack now keeps the first
+      one it reads for the rest of the process, as every other Rakudo does;
+      a stand-in $*DISTRO a test declares still wins, and one in force while
+      the pack loads is never kept. t/17 counts the process's handles around
+      a few hundred of each; t/18 pins the stand-in rule.
+    - [2026-10-01] BUGFIX: on Windows the command-shape check finds programs
+      on the real search path. It read %*ENV<PATH>, but a Windows process is
+      handed PATH spelt "Path" and %*ENV is case-sensitive, so it searched
+      nothing and a bare name with an argument stuck to it ("git status"
+      as the command) was never recognised to correct. PATH and PATHEXT are
+      now read without regard to case on Windows; POSIX names stay exact.
+      An environment carrying both spellings at once -- an MSYS or Cygwin
+      parent hands over PATH and Path -- gets one fixed answer rather than
+      whichever key the hash iterated first: the exact spelling asked for,
+      else the first case-insensitive match in sorted order. t/15 pins it.
+      t/15 wrote %*ENV<PATH> too, adding a second entry beside the real one,
+      so which one a child searched depended on hash order and its bare-name
+      test passed or failed by chance. It writes to the spelling that is
+      there, and pins the "Path" spelling under the faked Windows rules on
+      every host.
+    - [2026-09-28] Requires JSON::Fast 0.21.0 or later (zef:timo). 0.19
+      (cpan:TIMOTIMO) fails its own tests under the RakuAST compiler
+      frontend that Rakudo 2026.09 makes the default, so installing this
+      distribution stopped at that dependency.
+    - [2026-09-19] "args" and "run"'s "timeout" now publish a JSON Schema
+      default, so the contract the model reads says what omitting them means.
+      "args" defaults to [] -- an empty argv vector, a command run with no
+      arguments at all -- which is worth saying out loud, because a model that
+      omits it gets a call that works and does the wrong thing rather than an
+      error that teaches it. "run"'s "timeout" defaults to this toolkit's own
+      .timeout, so a kit built with timeout => 5 publishes 5; "start" still
+      publishes none, because a background job that names no timeout runs
+      until it finishes or is killed. "cwd", "stdin" and "output"'s "cursor"
+      publish none either, and for reasons now written down in the Pod. No
+      handler changed, and the new t/16-schema-contract.rakutest pins each
+      claim against the handler rather than against the registration.
+      (The defaults reach the wire with the MCP::Server release that
+      carries a param spec's `default` into the emitted schema; against an
+      older one they are simply not published.)
+    - [2026-09-19] "command" is now one executable and nothing else: a command
+      line in that argument is refused before anything is spawned, with an
+      error that names both fields and shows the corrected call --
+      {"command": "prove6", "args": ["--help"]} for a caller who sent
+      {"command": "prove6 --help"}. Spawned as the argv vector this pack
+      promises, that call asked for a program with a space and two dashes in
+      its name, and the failure it got back ("could not run 'prove6 --help':
+      No such file or directory") reads exactly like a missing binary: one
+      model took it as one, spent twenty-six calls hunting for binaries that
+      were on PATH the whole time, and never recovered, because nothing ever
+      told it what it had got wrong.
+      The rule: a command is refused when it does not name an existing
+      executable AND either it contains a shell metacharacter (| & ; < > ( )
+      $ ` newline, carriage return) or it contains whitespace and its first
+      word does name an executable -- the case where the correction can be
+      made exactly, by name. Resolution comes first in both arms, so a path
+      that legitimately contains a space or parentheses still runs; the
+      second arm asks for the buried program by name, so a spacey path to
+      something that is not there is still the ordinary exit -1 spawn failure
+      rather than a shape error. Resolution is the platform's own: a path
+      separator (slash, or a backslash or drive letter on Windows) means a
+      path, anything else is looked for on PATH, with PATHEXT appended and no
+      execute bit asked for on Windows. Nothing is ever auto-split and run:
+      that would put back the quoting ambiguity an argv vector exists to
+      remove, and a client-side policy's argument-aware rules match on argv,
+      so a shell string smuggled through as one command would slip past them.
+    - [2026-09-19] the "command" and "args" schema descriptions, and the "run"
+      and "start" tool descriptions, now state the contract where a model
+      reads it while filling the field: command is the name or path of ONE
+      executable, arguments go in args, and a command line is refused. The
+      old "Command to run. Any executable the server user can run is allowed."
+      invited exactly the call above.
+    - MAINT: [2026-08-27] moved the shared test fixtures from
+      C<t/lib/ShellTest.rakumod> into
+      C<lib/MCP/Server/Tool/Shell/Test/Kit.rakumod>
+      (C<MCP::Server::Tool::Shell::Test::Kit>). A C<t/lib> directory
+      is its own CompUnit repo that starts cold on a fresh C<zef
+      install>, and parallel test files pulling the fixture's
+      dependency chain into that cold store can race and fail the
+      install outright. C<lib/> is staged and precompiled before the
+      test phase runs, so shipping test support inside the dist's own
+      namespace dissolves the race. This is the fleet-wide convention
+      going forward.
+
 0.4.1  2026-08-21T22:04:14+01:00
     - Fix every kill on Windows dying with "expected Callable but got Hash":
       the taskkill branch of kill-process-tree tapped the reaper's output with

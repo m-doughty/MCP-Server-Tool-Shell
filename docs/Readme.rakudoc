@@ -157,6 +157,30 @@ pass a C<prefix> of your own.
 
 =head2 Tools
 
+The C<Required> column of every table below is the published JSON Schema's
+C<required> array: C<command> for C<run> and C<start>, C<job> for C<poll>,
+C<output> and C<kill>, and nothing at all for C<allowed>. The model reads it
+before it calls, so the tables and the schema have to agree.
+
+Two parameters also publish a JSON Schema C<default>, because omitting them
+means something specific rather than nothing:
+
+=item C<args> defaults to C<[]> — an empty argv vector, which is a command
+run with no arguments at all. That is worth saying out loud: a model that
+omits C<args> gets a call that works and does the wrong thing, rather than an
+error that teaches it.
+=item C<run>'s C<timeout> defaults to this toolkit's own C<.timeout>, so a
+kit built with C<< timeout => 5 >> publishes C<5>. C<start>'s does not: a
+background job that names no timeout runs until it finishes or is killed,
+which is an absence rather than a value.
+
+C<cwd>, C<stdin> and C<output>'s C<cursor> publish no default on purpose. An
+omitted C<cwd> runs in the toolkit's configured directory (or the server
+process's own), which is a fact about the deployment rather than about the
+tool; an omitted C<stdin> is a closed pipe rather than an empty string being
+substituted; and an omitted C<cursor> asks for a snapshot rather than
+standing in for a position.
+
 =head3 Which of them may run at once
 
 C<allowed>, C<poll> and C<output> declare the MCP annotations
@@ -183,8 +207,8 @@ Runs one command in the foreground and waits for it.
 =begin table
 Argument | Type            | Required | Meaning
 =========|=================|==========|===========================================
-command  | string          | yes      | Must be `eq` an entry of the allow list
-args     | array of string | no       | One array entry per argument
+command  | string          | yes      | ONE executable, never a command line; `eq` an entry of the allow list
+args     | array of string | no       | Every argument, one array entry each
 cwd      | string          | no       | Working directory, overriding the default
 stdin    | string          | no       | Text to write to standard input, then close
 timeout  | number          | no       | Seconds, overriding the server default
@@ -245,6 +269,81 @@ Examples of the call shape (arguments as an MCP client would send them):
 
 That third one is the point of an argv vector: C<fix the thing> is a single
 argument, quoted by nobody, split by nobody.
+
+=head3 One executable, not a command line
+
+C<command> is the name or path of B<one> executable, and everything else is an
+entry in C<args>:
+
+=begin code :lang<json>
+{ "command": "prove6", "args": ["--help"] }
+=end code
+
+A call that puts the whole line in C<command> instead is refused before
+anything is spawned, with an error that shows the corrected call:
+
+=begin code
+'command' takes the name or path of ONE executable: this tool spawns an argv
+vector with no shell, so arguments belong in 'args', never in 'command'.  Got
+'prove6 --help', which is not a program on this system, but 'prove6' is.
+Write the call as {"command": "prove6", "args": ["--help"]} instead.
+=end code
+
+The refusal is there because the alternative reads like something else
+entirely. Spawned as the argv vector this pack promises, C<prove6 --help> is a
+request for a program with a space and two dashes in its name, and the failure
+that comes back — C<could not run 'prove6 --help': No such file or directory>
+— looks exactly like a missing binary. A model that reads it that way goes
+hunting for binaries that were on C<PATH> all along, and nothing in the
+transcript ever tells it what it actually got wrong.
+
+The rule, exactly. A C<command> is refused when it does not name an existing
+executable B<and> it looks like a command line rather than a program name,
+which means either of:
+
+=item it contains one of the shell metacharacters
+
+=begin code
+| & ; < > ( ) $ ` and a newline or carriage return
+=end code
+
+=item or it contains whitespace B<and> its first whitespace-delimited word
+does name an executable — the case where the call can be corrected exactly, by
+name.
+
+Resolution comes first in both arms because a path may contain whatever the
+filesystem allows: C</Applications/My App/bin/tool> runs, and so does
+C<C:\Program Files (x86)\Git\cmd\git.exe>, parentheses and all. It is the
+platform's own resolution — a string containing a path separator (a slash, or
+on Windows a backslash or a drive letter) is a path, and anything else is
+looked for on C<PATH>, with C<PATHEXT> appended on Windows. A file is
+executable if it carries the execute bit on POSIX, and if it is simply there on
+Windows, which has no such bit and leaves the judgement to C<CreateProcess>.
+
+The second arm asks for the buried program by name rather than settling for
+"there is a space in here" on its own, which keeps two classes of call
+working. A spacey path to something that is not there — a typo, a build
+artefact that was never produced — stays a L<missing binary|#run>, reported as
+C<exit -1> in the payload the way it always was, rather than being mislabelled
+a mistake about the call's shape. And a legitimate program that happens to sit
+under C<My Documents> is never refused on suspicion.
+
+The correction quoted in the message is derived by splitting on whitespace,
+and that is the only splitting that happens anywhere: a refused command is
+never split and run. Auto-splitting would put back the quoting ambiguity an
+argv vector exists to remove, and a policy in front of these tools (see
+L<MCP::Client::Policy>) matches its argument-aware rules on argv, so a shell
+string smuggled through as a single command would slip past the very rules
+meant to inspect it. If you want a shell, make the shell itself the
+C<command> and pass the script as one entry in C<args> — where the policy, and
+anybody reading the transcript, can see it:
+
+=begin code :lang<json>
+{ "command": "/bin/sh", "args": ["-c", "make 2>&1 | tail -40"] }
+=end code
+
+C<start> applies the same rule at the same point, and refuses without minting
+a job.
 
 =head3 Standard input
 

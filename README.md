@@ -128,6 +128,16 @@ The default prefix is `sh`, so the tools below are registered as `sh_run`, `sh_s
 Tools
 -----
 
+The `Required` column of every table below is the published JSON Schema's `required` array: `command` for `run` and `start`, `job` for `poll`, `output` and `kill`, and nothing at all for `allowed`. The model reads it before it calls, so the tables and the schema have to agree.
+
+Two parameters also publish a JSON Schema `default`, because omitting them means something specific rather than nothing:
+
+  * `args` defaults to `[]` — an empty argv vector, which is a command run with no arguments at all. That is worth saying out loud: a model that omits `args` gets a call that works and does the wrong thing, rather than an error that teaches it.
+
+  * `run`'s `timeout` defaults to this toolkit's own `.timeout`, so a kit built with `timeout => 5 ` publishes `5`. `start`'s does not: a background job that names no timeout runs until it finishes or is killed, which is an absence rather than a value.
+
+`cwd`, `stdin` and `output`'s `cursor` publish no default on purpose. An omitted `cwd` runs in the toolkit's configured directory (or the server process's own), which is a fact about the deployment rather than about the tool; an omitted `stdin` is a closed pipe rather than an empty string being substituted; and an omitted `cursor` asks for a snapshot rather than standing in for a position.
+
 ### Which of them may run at once
 
 `allowed`, `poll` and `output` declare the MCP annotations `readOnlyHint => True ` and `idempotentHint => True `; `run`, `start` and `kill` declare nothing.
@@ -145,7 +155,7 @@ Runs one command in the foreground and waits for it.
 <th>Argument</th> <th>Type</th> <th>Required</th> <th>Meaning</th>
 </tr></thead>
 <tbody>
-<tr> <td>command</td> <td>string</td> <td>yes</td> <td>Must be `eq` an entry of the allow list</td> </tr> <tr> <td>args</td> <td>array of string</td> <td>no</td> <td>One array entry per argument</td> </tr> <tr> <td>cwd</td> <td>string</td> <td>no</td> <td>Working directory, overriding the default</td> </tr> <tr> <td>stdin</td> <td>string</td> <td>no</td> <td>Text to write to standard input, then close</td> </tr> <tr> <td>timeout</td> <td>number</td> <td>no</td> <td>Seconds, overriding the server default</td> </tr>
+<tr> <td>command</td> <td>string</td> <td>yes</td> <td>ONE executable, never a command line; `eq` an entry of the allow list</td> </tr> <tr> <td>args</td> <td>array of string</td> <td>no</td> <td>Every argument, one array entry each</td> </tr> <tr> <td>cwd</td> <td>string</td> <td>no</td> <td>Working directory, overriding the default</td> </tr> <tr> <td>stdin</td> <td>string</td> <td>no</td> <td>Text to write to standard input, then close</td> </tr> <tr> <td>timeout</td> <td>number</td> <td>no</td> <td>Seconds, overriding the server default</td> </tr>
 </tbody>
 </table>
 
@@ -194,6 +204,43 @@ Examples of the call shape (arguments as an MCP client would send them):
 ```
 
 That third one is the point of an argv vector: `fix the thing` is a single argument, quoted by nobody, split by nobody.
+
+### One executable, not a command line
+
+`command` is the name or path of **one** executable, and everything else is an entry in `args`:
+
+```json
+{ "command": "prove6", "args": ["--help"] }
+```
+
+A call that puts the whole line in `command` instead is refused before anything is spawned, with an error that shows the corrected call:
+
+    'command' takes the name or path of ONE executable: this tool spawns an argv
+    vector with no shell, so arguments belong in 'args', never in 'command'.  Got
+    'prove6 --help', which is not a program on this system, but 'prove6' is.
+    Write the call as {"command": "prove6", "args": ["--help"]} instead.
+
+The refusal is there because the alternative reads like something else entirely. Spawned as the argv vector this pack promises, `prove6 --help` is a request for a program with a space and two dashes in its name, and the failure that comes back — `could not run 'prove6 --help': No such file or directory` — looks exactly like a missing binary. A model that reads it that way goes hunting for binaries that were on `PATH` all along, and nothing in the transcript ever tells it what it actually got wrong.
+
+The rule, exactly. A `command` is refused when it does not name an existing executable **and** it looks like a command line rather than a program name, which means either of:
+
+  * it contains one of the shell metacharacters
+
+    | & ; < > ( ) $ ` and a newline or carriage return
+
+  * or it contains whitespace **and** its first whitespace-delimited word does name an executable — the case where the call can be corrected exactly, by name.
+
+Resolution comes first in both arms because a path may contain whatever the filesystem allows: `/Applications/My App/bin/tool` runs, and so does `C:\Program Files (x86)\Git\cmd\git.exe`, parentheses and all. It is the platform's own resolution — a string containing a path separator (a slash, or on Windows a backslash or a drive letter) is a path, and anything else is looked for on `PATH`, with `PATHEXT` appended on Windows. A file is executable if it carries the execute bit on POSIX, and if it is simply there on Windows, which has no such bit and leaves the judgement to `CreateProcess`.
+
+The second arm asks for the buried program by name rather than settling for "there is a space in here" on its own, which keeps two classes of call working. A spacey path to something that is not there — a typo, a build artefact that was never produced — stays a [missing binary](#run), reported as `exit -1` in the payload the way it always was, rather than being mislabelled a mistake about the call's shape. And a legitimate program that happens to sit under `My Documents` is never refused on suspicion.
+
+The correction quoted in the message is derived by splitting on whitespace, and that is the only splitting that happens anywhere: a refused command is never split and run. Auto-splitting would put back the quoting ambiguity an argv vector exists to remove, and a policy in front of these tools (see [MCP::Client::Policy](MCP::Client::Policy)) matches its argument-aware rules on argv, so a shell string smuggled through as a single command would slip past the very rules meant to inspect it. If you want a shell, make the shell itself the `command` and pass the script as one entry in `args` — where the policy, and anybody reading the transcript, can see it:
+
+```json
+{ "command": "/bin/sh", "args": ["-c", "make 2>&1 | tail -40"] }
+```
+
+`start` applies the same rule at the same point, and refuses without minting a job.
 
 ### Standard input
 

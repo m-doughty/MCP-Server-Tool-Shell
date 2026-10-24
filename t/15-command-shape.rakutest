@@ -1,0 +1,354 @@
+use Test;
+use MCP::Server::Tool::Shell::Test::Kit;
+use JSON::Fast;
+use MCP::Server;
+use MCP::Server::Tool::Shell;
+
+# "command" is one executable and nothing else.
+#
+# The incident these tests exist for: a model drove this pack for twenty-six
+# calls with whole command lines in "command" and an empty "args" — {"command":
+# "prove6 --help"} — and got back "could not run 'prove6 --help': No such file
+# or directory", which reads like a missing binary.  It went hunting for
+# binaries that were on PATH all along and never recovered, because nothing
+# ever told it what it had actually done wrong.
+#
+# So a command line is refused before anything is spawned, with an error that
+# shows the corrected call; a path that legitimately contains a space still
+# runs; and a binary that is genuinely missing still answers the way it always
+# has, in the payload rather than as an error result.
+
+plan 9;
+
+my constant IS-WIN = $*DISTRO.is-win;
+
+my $raku = raku-path();
+
+# A scratch directory for the probe programs, and one directory inside it
+# whose name contains a space.
+my $work = $*TMPDIR.add("mcp-shell-shape-{$*PID}-{now.Int}");
+$work.mkdir;
+my $bin = $work.add('bin');
+$bin.mkdir;
+my $spacey = $work.add('my dir');
+$spacey.mkdir;
+my $winish = $work.add('win');
+$winish.mkdir;
+END {
+	try {
+		for ($bin, $spacey, $winish, $work) -> $dir {
+			.unlink for $dir.dir.grep(*.f);
+		}
+		.rmdir for ($bin, $spacey, $winish, $work);
+	}
+}
+
+# The one program each platform can drop into an arbitrary directory and still
+# execute with no shell anywhere: POSIX symlinks the running interpreter,
+# Windows copies the command processor, which is self-contained and needs no
+# execute bit (Windows has none).  Both are spawned as an argv vector like
+# everything else this pack runs.
+sub install-probe(IO::Path:D $path --> Nil) {
+	IS-WIN
+		?? (%*ENV<COMSPEC> // 'C:\\Windows\\System32\\cmd.exe').IO.copy($path)
+		!! $raku.IO.symlink($path);
+}
+
+my constant PROBE-ARGS = IS-WIN ?? ('/c', 'echo probe ok') !! ('-e', 'print "probe ok"');
+my constant PROBE-OUT  = 'probe ok';
+
+# The name the tests ask for.  Deliberately without the Windows extension: a
+# bare name on PATH is resolved through PATHEXT there, which is the arm of the
+# resolver only Windows runs.
+my constant PROBE = 'mcp-shell-probe';
+
+install-probe($bin.add(PROBE ~ (IS-WIN ?? '.exe' !! '')));
+
+# The key this process's PATH is held under.  Windows hands it over spelt
+# "Path" and %*ENV is case-sensitive: writing <PATH> there would add a second
+# entry beside the real one, and a child is then handed both -- which one its
+# search uses depends on hash order, so the bare-name test below passed or
+# failed by chance.  Write to the spelling that is there -- and, should there
+# be two, to the one the resolver reads (env-value's choice: the exact
+# spelling, else the first in sorted order).
+sub path-key(--> Str:D) {
+	return 'PATH' if !IS-WIN || (%*ENV<PATH>:exists);
+	%*ENV.keys.grep({ .fc eq 'path' }).sort.head // 'PATH';
+}
+
+# The probe's directory goes on PATH for the whole file.  PATH is split on its
+# own separator and never on whitespace, so it does not matter in the least
+# that $work itself may sit under a directory with a space in its name.
+%*ENV{path-key()} = $bin.absolute ~ (IS-WIN ?? ';' !! ':') ~ (%*ENV{path-key()} // '');
+
+sub any-server(--> MCP::Server:D) {
+	my $server = MCP::Server.new(:name<shape>);
+	$server.plug: MCP::Server::Tool::Shell.new(:allow-any);
+	$server;
+}
+
+sub allowlisted-server(*@allow --> MCP::Server:D) {
+	my $server = MCP::Server.new(:name<shape-listed>);
+	$server.plug: MCP::Server::Tool::Shell.new(:@allow);
+	$server;
+}
+
+# The corrected call the error is expected to quote, built the way a client
+# would read it rather than by asking the code under test.
+sub suggestion(Str:D $command, *@args --> Str:D) {
+	'{"command": "' ~ $command ~ '", "args": ['
+	  ~ @args.map({ '"' ~ $_ ~ '"' }).join(', ') ~ ']}';
+}
+
+subtest 'A command line in "command" is refused, and the error teaches the right call' => {
+	plan 9;
+	my $server = any-server();
+
+	my %response = call($server, 'sh_run', { command => PROBE ~ ' --help', args => [] });
+	ok %response<result><isError>, 'An error result, not a spawn attempt';
+
+	my $message = text(%response);
+	ok $message.contains(q{'command'}), 'The message names the command field';
+	ok $message.contains(q{'args'}), 'and the args field';
+	ok $message.contains('no shell'), 'and says why there can be no command line';
+	ok $message.contains(suggestion(PROBE, '--help')),
+		'and shows this very call, corrected';
+	diag "message was: $message"
+		unless $message.contains(suggestion(PROBE, '--help'));
+
+	# Several arguments are all carried across, in order.
+	my %several = call($server, 'sh_run',
+		{ command => PROBE ~ ' -I lib t/01-config.rakutest' });
+	ok text(%several).contains(suggestion(PROBE, '-I', 'lib', 't/01-config.rakutest')),
+		'Every buried argument becomes an entry of its own';
+
+	# A vast command line is quoted back bounded, and the correction is stated
+	# in the abstract rather than echoed whole: this message is something a
+	# model reads, not a place to repeat a hundred kilobytes of script.
+	my $vast = text(call($server, 'sh_run',
+		{ command => PROBE ~ ' ' ~ ('argument' xx 60).join(' ') }));
+	ok $vast.contains('…'), 'A vast command line is abbreviated in the message';
+	ok $vast.contains('{"command": "' ~ PROBE ~ '", "args": [ … one entry per argument … ]}'),
+		'and the correction is described rather than quoted';
+
+	# The shape of the call is decided before the allow list is consulted: it
+	# is wrong whoever is allowed to run what.
+	errors-with allowlisted-server(PROBE), 'sh_run', { command => PROBE ~ ' --help' },
+		'ONE executable', 'An allowlisted toolkit refuses the same shape';
+};
+
+subtest 'start refuses a command line exactly as run does' => {
+	plan 5;
+	# One slot, so a refusal that leaked a job would be visible: the real
+	# start below could not be admitted behind it.
+	my $server = MCP::Server.new(:name<shape-start>);
+	$server.plug: MCP::Server::Tool::Shell.new(:allow-any, max-jobs => 1);
+
+	my %response = call($server, 'sh_start', { command => PROBE ~ ' --help' });
+	ok %response<result><isError>, 'An error result rather than a job handle';
+
+	my $message = text(%response);
+	ok $message.contains(q{'args'}), 'The message names the args field';
+	ok $message.contains(suggestion(PROBE, '--help')), 'and shows the corrected call';
+
+	# Nothing was admitted, so the one slot is still free.
+	my %started = json-ok($server, 'sh_start',
+		{ command => PROBE, args => [|PROBE-ARGS] }, 'a real start afterwards');
+	ok wait-until({
+		from-json(text(call($server, 'sh_poll', { job => %started<job> })))<state> ne 'running'
+	}), 'and that job ran to completion';
+};
+
+subtest 'Shell metacharacters are refused whatever else is in the string' => {
+	plan 9;
+	my $server = any-server();
+
+	# No whitespace in any of these, and a head that exists nowhere: the only
+	# thing that can refuse them is the metacharacter itself.
+	my @cases =
+		('mcp-shell-nothing|wc',     q{'|'},  'a pipe'),
+		('mcp-shell-nothing;pwned',  q{';'},  'a semicolon'),
+		('mcp-shell-nothing>out',    q{'>'},  'a redirect'),
+		('mcp-shell-nothing<in',     q{'<'},  'a reverse redirect'),
+		('mcp-shell-nothing&&pwned', q{'&'},  'an ampersand'),
+		('mcp-shell-`date`',         q{'`'},  'a backtick'),
+		('$SHELL-mcp-shell-nothing', q{'$'},  'a dollar'),
+	;
+	for @cases -> ($command, $needle, $what) {
+		my %response = call($server, 'sh_run', { command => $command });
+		my $matched = %response<result><isError> && text(%response).contains($needle);
+		ok $matched, "Refused: $what";
+		diag "result was: {%response<result>.raku}" unless $matched;
+	}
+
+	my %newline = call($server, 'sh_run', { command => "mcp-shell-nothing\necho pwned" });
+	ok %newline<result><isError>, 'Refused: a newline';
+	ok text(%newline).contains('a newline'),
+		'and the message names it rather than printing it';
+};
+
+subtest 'A genuine missing binary is still a runtime condition, not a shape error' => {
+	plan 9;
+	my $server = any-server();
+
+	# A bare name that is nowhere: the message the pack has always given.
+	my %got = run-ok($server, { command => 'mcp-shell-no-such-command', timeout => 30 },
+		'missing bare name');
+	is %got<exit>, -1, 'exit is -1';
+	ok %got<stderr>.chars > 0, 'with the reason on stderr';
+	nok %got<stderr>.contains('ONE executable'), 'and no lecture about the call shape';
+
+	# A path with a space in it that simply is not there.  Its first word is
+	# not a program either, so nothing here is a command line and the payload
+	# is the ordinary spawn failure rather than a refusal.
+	my %spacey = run-ok($server,
+		{ command => $spacey.add('no-such-command').absolute, timeout => 30 },
+		'missing spacey path');
+	is %spacey<exit>, -1, 'a spacey path to nothing is still a spawn failure';
+	nok %spacey<stderr>.contains('ONE executable'), 'and still not a shape error';
+
+	# A file that is there and cannot be exec'd: POSIX has no execute bit on
+	# it, Windows has no executable content in it.  Either way the spawn is
+	# what fails, not the argument check.
+	my $plain = $spacey.add('plain file');
+	$plain.spurt('not an executable');
+	my %plainly = run-ok($server, { command => $plain.absolute, timeout => 30 },
+		'unexecutable file');
+	is %plainly<exit>, -1, 'an unexecutable file fails at the spawn';
+};
+
+subtest 'An executable whose path contains a space still runs' => {
+	plan 4;
+	my $tool = $spacey.add('probe tool' ~ (IS-WIN ?? '.exe' !! ''));
+	install-probe($tool);
+	ok $tool.e, 'The probe is where the test put it';
+
+	my $server = allowlisted-server($tool.absolute);
+	my %got = run-ok($server,
+		{ command => $tool.absolute, args => [|PROBE-ARGS], timeout => 30 },
+		'spacey executable');
+	is %got<stdout>.trim, PROBE-OUT, 'It ran, from a path with two spaces in it';
+	is %got<exit>, 0, 'and exited cleanly';
+};
+
+subtest 'An ordinary command-and-args call is untouched' => {
+	plan 5;
+	my $server = allowlisted-server($raku);
+
+	my %got = run-ok($server,
+		{ command => $raku, args => ['-e', 'print @*ARGS.join("|")', 'one two', '$HOME', 'a;b'] },
+		'ordinary call');
+	is %got<stdout>, 'one two|$HOME|a;b',
+		'Arguments keep their spaces and their metacharacters';
+	is %got<exit>, 0, 'and the run is a run like any other';
+
+	# The bare probe name, straight off PATH.
+	my %bare = run-ok(allowlisted-server(PROBE),
+		{ command => PROBE, args => [|PROBE-ARGS], timeout => 30 },
+		'bare name from PATH');
+	is %bare<stdout>.trim, PROBE-OUT, 'A resolvable bare name runs as it always did';
+};
+
+subtest 'The buried program is found on PATH, and a stray trailing space is caught' => {
+	plan 4;
+	my $server = any-server();
+
+	# PROBE is only findable by walking PATH, which is the arm of the resolver
+	# a bare name takes.
+	my %response = call($server, 'sh_run', { command => PROBE ~ ' --version' });
+	ok %response<result><isError>, 'A bare name with an argument stuck to it is refused';
+	ok text(%response).contains(suggestion(PROBE, '--version')),
+		'and the program was found on PATH to correct the call with';
+
+	# One argument and no argument are the same mistake.
+	my %trailing = call($server, 'sh_run', { command => PROBE ~ ' ' });
+	ok %trailing<result><isError>, 'A trailing space alone is refused';
+	ok text(%trailing).contains("but '" ~ PROBE ~ "' is"),
+		'and the message points at the program the caller meant';
+};
+
+subtest 'The Windows arm of the resolver: no execute bit, PATHEXT and a ; PATH' => {
+	plan 4;
+	# Windows has no execute bit, spells its PATH separator ';' and appends
+	# PATHEXT to a bare name.  Faking $*DISTRO runs that arm on every platform,
+	# the way t/14 runs the Windows kill branch: nothing is spawned here, since
+	# every call in this subtest is refused before it reaches a process.
+	my $tool = $winish.add('wintool.exe');
+	$tool.spurt('not executable by any POSIX measure');
+
+	my $server = any-server();
+	my %*ENV = %*ENV;
+	%*ENV<PATHEXT> = '.EXE';
+
+	{
+		my $*DISTRO = class { method is-win { True } }.new;
+		%*ENV{path-key()} = $winish.absolute ~ ';' ~ $bin.absolute;
+
+		my %response = call($server, 'sh_run', { command => 'wintool --flag' });
+		ok %response<result><isError>,
+			'A bare name resolved through PATHEXT confirms a command line';
+		ok text(%response).contains(suggestion('wintool', '--flag')),
+			'and the corrected call names it';
+	}
+
+	{
+		# A Windows process is handed PATH spelt "Path"; the resolver reads it
+		# under whatever spelling it has.
+		my $*DISTRO = class { method is-win { True } }.new;
+		my %*ENV = %*ENV.grep({ .key.fc ne 'path' });
+		%*ENV<Path> = $winish.absolute ~ ';' ~ $bin.absolute;
+		ok call($server, 'sh_run', { command => 'wintool --flag' })<result><isError>,
+			'PATH is found when it is spelt "Path", as Windows spells it';
+	}
+
+	# The same call under this platform's own rules.  On POSIX "wintool" is
+	# not an executable at all — nothing appends an extension, and the file
+	# has no execute bit — so nothing is confirmed, nothing is refused, and
+	# the spawn is left to fail on its own.  On Windows the rules faked above
+	# are the real ones and the refusal stands.
+	%*ENV{path-key()} = $winish.absolute ~ (IS-WIN ?? ';' !! ':') ~ $bin.absolute;
+	my %native = call($server, 'sh_run', { command => 'wintool --flag', timeout => 30 });
+	is so %native<result><isError>, IS-WIN,
+		'and this platform applies its own answer to the same question';
+};
+
+# An MSYS or Cygwin parent hands a Windows process both PATH and Path, and a
+# Hash has no order to choose between them by: reading "the first key that
+# folds to path" read whichever the hash happened to iterate first.  The
+# choice is fixed now -- the exact spelling asked for, else the first match in
+# sorted order -- and pinned here under faked Windows rules on every host.
+subtest 'env-value: one spelling, and always the same one' => {
+	my @orders = <PATH Path path>.permutations;
+	plan 5 + @orders.elems;
+	my &env-value = &MCP::Server::Tool::Shell::env-value;
+
+	{
+		my $*DISTRO = class { method is-win { True } }.new;
+		my %*ENV = %*ENV.grep({ .key.fc ne 'path' });
+		%*ENV<Path> = 'from Path';
+		%*ENV<PATH> = 'from PATH';
+		%*ENV<path> = 'from path';
+		is env-value('PATH'), 'from PATH', 'the exact spelling, when there is one';
+		is env-value('Path'), 'from Path', 'whichever spelling was asked for';
+		is env-value('pAtH'), 'from PATH', 'otherwise the first match in sorted order';
+
+		for @orders -> @order {
+			my %*ENV = %*ENV.grep({ .key.fc ne 'path' });
+			%*ENV{$_} = "from $_" for @order;
+			%*ENV<PATH>:delete;
+			is env-value('PATH'), 'from Path',
+				"Path before path, however they went in ({@order.join(', ')})";
+		}
+	}
+
+	{
+		my $*DISTRO = class { method is-win { False } }.new;
+		my %*ENV = %*ENV.grep({ .key.fc ne 'path' });
+		%*ENV<Path> = 'from Path';
+		nok env-value('PATH').defined, 'POSIX names are exact: Path is not PATH';
+		%*ENV<PATH> = 'from PATH';
+		is env-value('PATH'), 'from PATH', 'and PATH is';
+	}
+};
+
+done-testing;

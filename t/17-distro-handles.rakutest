@@ -1,0 +1,123 @@
+use v6.d;
+use Test;
+use NativeCall;
+use MCP::Server::Tool::Shell::Test::Kit;
+use MCP::Server;
+use MCP::Server::Tool::Shell;
+use MCP::Server::Tool::Shell::Isolation;
+
+# A long-running host makes thousands of tool calls, so a call that keeps one
+# file descriptor is a host that stops working: at macOS's default limit of
+# 256 it is a few dozen calls before no command can be spawned.  Rakudo
+# 2026.09 builds $*DISTRO afresh on every read, and on macOS each build
+# leaves a pipe open -- so every read this pack made kept one, and a refused
+# command line, which reads it once for every PATH entry it looks in, kept
+# dozens.  The pack files the first $*DISTRO under the key the lookup reads
+# (see the top of MCP::Server::Tool::Shell::Isolation); this file counts.
+#
+# The counts come from the kernel: the descriptor listing on Linux and macOS,
+# GetProcessHandleCount on Windows.  Every comparison is between two readings
+# taken around the same work, after that work has already run once, so that
+# whatever a first call opens for good -- a thread, a resolved trampoline --
+# is in both.  The leak this file exists for is per read, so a few hundred
+# calls show it in the hundreds; SLACK is the most the count may drift by.
+
+plan 5;
+
+# Read once, here: a counter that read $*DISTRO on every call would, on the
+# Rakudo this file is about, be counting its own leak.
+my constant IS-WIN = $*DISTRO.is-win;
+my constant CALLS  = 300;
+my constant SHAPES = 100;
+my constant SLACK  = 10;
+
+# Windows publishes no listing of a process's handles; kernel32 counts them.
+# Bound lazily by NativeCall, so declaring them costs a POSIX process nothing.
+my sub win-current-process(--> Pointer)
+	is native('kernel32') is symbol('GetCurrentProcess') { * }
+my sub win-process-handle-count(Pointer, uint32 is rw --> int32)
+	is native('kernel32') is symbol('GetProcessHandleCount') { * }
+
+# How many files, pipes, sockets and other handles this process holds open.
+# The listing's own directory handle is in every reading, so it cancels out
+# of a difference; it is read to its end (.elems) because a listing left
+# unfinished keeps its handle open after the reading is taken.  Windows counts
+# thread and event handles too, so only a difference means anything.
+sub open-handle-count(--> Int:D) {
+	if IS-WIN {
+		my uint32 $count = 0;
+		die 'open-handle-count: GetProcessHandleCount failed'
+			unless win-process-handle-count(win-current-process(), $count);
+		return $count;
+	}
+	for '/proc/self/fd', '/dev/fd' -> $listing {
+		my $count = try $listing.IO.dir.elems;
+		return $count if $count.defined;
+	}
+	die 'open-handle-count: this host publishes no list of the descriptors a process holds';
+}
+
+#| How far the handle count moved across &work, which has already run once.
+sub drift(&work --> Int:D) {
+	work();
+	my Int:D $before = open-handle-count();
+	work();
+	open-handle-count() - $before;
+}
+
+subtest '$*DISTRO is one object for the life of the process' => {
+	plan 3;
+
+	ok $*DISTRO === $*DISTRO, 'Two reads of $*DISTRO return the same object';
+
+	my Int:D $reads = drift({ my $windows; $windows = $*DISTRO.is-win for ^CALLS });
+	ok $reads <= SLACK, "{CALLS} reads of it hold no handle open (the count moved by $reads)";
+
+	# Kernel.name asks $*DISTRO, so it leaked on every read too.
+	my Int:D $kernel = drift({ my $name; $name = $*KERNEL.name for ^CALLS });
+	ok $kernel <= SLACK, "nor do {CALLS} reads of \$*KERNEL.name (the count moved by $kernel)";
+};
+
+subtest 'reading the environment holds no handle open' => {
+	plan 2;
+
+	ok MCP::Server::Tool::Shell::env-value('PATH').defined, 'PATH is read';
+	my Int:D $moved = drift({ MCP::Server::Tool::Shell::env-value('PATH') for ^CALLS });
+	ok $moved <= SLACK, "{CALLS} reads of PATH hold no handle open (the count moved by $moved)";
+};
+
+subtest 'resolving the isolation holds no handle open' => {
+	plan 2;
+
+	ok resolve-isolation().mechanism.chars, 'The isolation resolves';
+	my Int:D $moved = drift({ resolve-isolation() for ^CALLS });
+	ok $moved <= SLACK, "{CALLS} resolutions hold no handle open (the count moved by $moved)";
+};
+
+subtest 'asking to kill a process group holds no handle open' => {
+	plan 2;
+
+	# Pid 0 names no child of ours, so nothing is ever signalled: the call
+	# answers False after its platform check, which is the read under test.
+	nok kill-process-group(0), 'A pid that names no child kills nothing';
+	my Int:D $moved = drift({ kill-process-group(0) for ^CALLS });
+	ok $moved <= SLACK, "{CALLS} requests hold no handle open (the count moved by $moved)";
+};
+
+subtest 'a refused command line holds no handle open' => {
+	plan 3;
+
+	# The pipe makes this a command line whatever is on PATH, so it is refused
+	# before anything is spawned -- after the pack has looked for the whole
+	# string, and then for its first word, in every PATH entry.
+	my $server = MCP::Server.new(:name<distro-handles>);
+	$server.plug: MCP::Server::Tool::Shell.new(:allow-any);
+	my %call = command => 'mcp-shell-no-such-program | cat', args => [];
+
+	my %response = call($server, 'sh_run', %call);
+	ok errored(%response), 'The command line is refused';
+	ok text(%response).contains(q{'command'}), 'with the command-shape error';
+
+	my Int:D $moved = drift({ call($server, 'sh_run', %call) for ^SHAPES });
+	ok $moved <= SLACK, "{SHAPES} refusals hold no handle open (the count moved by $moved)";
+};

@@ -1,6 +1,5 @@
 use Test;
-use lib 't/lib';
-use ShellTest;
+use MCP::Server::Tool::Shell::Test::Kit;
 use MCP::Server;
 use MCP::Server::Tool::Shell;
 use MCP::Server::Tool::Shell::Buffer;

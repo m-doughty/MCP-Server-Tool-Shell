@@ -1,0 +1,31 @@
+use v6.d;
+use Test;
+
+# The pack files the first $*DISTRO it reads under the key Rakudo's lookup
+# asks for, so the object is built once per process rather than once per read
+# (see the top of MCP::Server::Tool::Shell::Isolation, and t/17).  It must only
+# ever file a real one.  A test that fakes Windows declares a stand-in
+# $*DISTRO, and a pack loaded while that stand-in is in scope reads the
+# stand-in: filing it would make every later read in the process -- in every
+# module, long after the test's scope has closed -- answer "Windows".
+#
+# Its own file because the pack loads once per process: this has to be the
+# first load, and it has to happen at run time, inside the stand-in's scope.
+
+plan 3;
+
+my class FakeWinDistro {
+	method is-win { True }
+}
+
+my Bool $loaded = False;
+{
+	my $*DISTRO = FakeWinDistro.new;
+	require ::('MCP::Server::Tool::Shell::Isolation');
+	$loaded = True;
+}
+
+ok $loaded, 'The pack loaded inside the stand-in';
+nok PROCESS::<$DISTRO> ~~ FakeWinDistro,
+	'The stand-in in force while it loaded was not filed for the process';
+ok $*DISTRO ~~ Distro:D, 'Outside the stand-in, $*DISTRO is the real one';

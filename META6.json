@@ -7,7 +7,7 @@
   ],
   "depends": [
     "MCP::Server:auth<zef:apogee>:ver<0.6.0+>",
-    "JSON::Fast:ver<0.19>:auth<cpan:TIMOTIMO>"
+    "JSON::Fast:ver<0.21.0+>:auth<zef:timo>"
   ],
   "description": "Allowlisted command-runner toolkit for MCP::Server, with capped output, streaming and background jobs",
   "license": "Artistic-2.0",
@@ -17,7 +17,8 @@
     "MCP::Server::Tool::Shell": "lib/MCP/Server/Tool/Shell.rakumod",
     "MCP::Server::Tool::Shell::Buffer": "lib/MCP/Server/Tool/Shell/Buffer.rakumod",
     "MCP::Server::Tool::Shell::Isolation": "lib/MCP/Server/Tool/Shell/Isolation.rakumod",
-    "MCP::Server::Tool::Shell::Jobs": "lib/MCP/Server/Tool/Shell/Jobs.rakumod"
+    "MCP::Server::Tool::Shell::Jobs": "lib/MCP/Server/Tool/Shell/Jobs.rakumod",
+    "MCP::Server::Tool::Shell::Test::Kit": "lib/MCP/Server/Tool/Shell/Test/Kit.rakumod"
   },
   "resources": [
   ],
@@ -30,5 +31,5 @@
   ],
   "test-depends": [
   ],
-  "version": "0.4.1"
+  "version": "0.4.2"
 }

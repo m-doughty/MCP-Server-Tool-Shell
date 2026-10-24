@@ -49,6 +49,38 @@ use NativeCall;
 #| See L<#sub isolation-candidates> for which trampolines are used and why.
 unit module MCP::Server::Tool::Shell::Isolation;
 
+# Rakudo 2026.09 builds $*DISTRO afresh on every read instead of once per
+# process: its lazy initialiser files the object it built under the key
+# '$*DISTRO', and the lookup only ever asks for '$DISTRO'.  On macOS each
+# build runs sw_vers and leaves the pipe it read the answer from open, so
+# every read costs a process and a file descriptor that is never given back
+# -- and so does every $*KERNEL.name, which asks $*DISTRO for its answer.
+# This pack asks $*DISTRO once for every PATH entry a command-shape check
+# looks in, for every environment variable it reads and for every kill, so a
+# long-running host at macOS's default limit of 256 descriptors ran out:
+# commands could no longer be spawned, and then nothing could be opened at
+# all.  Filing the object under the key the lookup reads makes it the one
+# every later read returns, as on every other release; where the key is
+# already there, which is everywhere the bug is not, nothing is filed.  It is
+# done here because every module in the pack that reads $*DISTRO loads this
+# one first.
+#
+# Only a real Distro is filed.  A module loaded inside a test's stand-in
+# $*DISTRO (`my $*DISTRO = class { method is-win { True } }.new`, the usual
+# way to exercise a Windows branch on another OS) reads the stand-in here,
+# and filing that would make it the whole process's for good; such a process
+# is left to Rakudo's own behaviour instead.  A stand-in declared after the
+# pack has loaded -- t/14 and t/15 declare theirs -- still wins: a dynamic
+# variable in scope is found before PROCESS is ever consulted.
+#
+# The bug came in with rakudo/rakudo a22cab8f9 (2026-09-02); delete this
+# once no supported Rakudo has it.
+unless PROCESS::<$DISTRO>:exists {
+	my $distro := $*DISTRO;
+	PROCESS::<$DISTRO> := $distro
+		if $distro ~~ Distro:D && !(PROCESS::<$DISTRO>:exists);
+}
+
 # SIGKILL is 9 on every POSIX platform this runs on; Signal::SIGKILL is the
 # authority for it, and .value keeps the enum out of the native call.
 my constant KILL-SIGNAL = Signal::SIGKILL.value;

@@ -1,6 +1,5 @@
 use Test;
-use lib 't/lib';
-use ShellTest;
+use MCP::Server::Tool::Shell::Test::Kit;
 use NativeCall;
 use JSON::Fast;
 use MCP::Server;
@@ -342,16 +341,41 @@ subtest 'A command that cannot be exec\'d is still a spawn failure' => {
 };
 
 subtest 'The trampoline never reaches a shell' => {
-	plan 3;
+	plan 4;
 	# A command name full of shell metacharacters: if anything in the isolation
 	# path handed this to sh -c, the semicolon would run a second command and the
 	# error would be the shell's, not a failure to exec this exact name.
 	my $evil = $work.add('ghost; echo pwned #').absolute;
 	my $server = shell-server(allow => [$evil]);
 
-	my %got = run-ok($server, { command => $evil, timeout => 30 }, 'metacharacter command');
-	is %got<exit>, -1, 'it simply could not be exec\'d';
-	is %got<stdout>, '', 'and nothing else ran';
+	# The tools refuse this shape at their own boundary now — a "command" that
+	# carries shell syntax is a command line somebody expected a shell to read
+	# (see t/15) — so the call never reaches a spawn at all.
+	my %refused = call($server, 'sh_run', { command => $evil, timeout => 30 });
+	ok %refused<result><isError>, 'the tool refuses a metacharacter-laden name outright';
+	ok text(%refused).contains('ONE executable'),
+		'saying that a command is one executable';
+
+	# The property the refusal sits in front of, asserted on the layer below
+	# it: the spawn Isolation.wrap builds for that same name execs it and
+	# nothing else, whatever a shell would have made of it.
+	my %spawn = resolve-isolation().wrap($evil, ());
+	my $proc = Proc::Async.new(%spawn<command>, |%spawn<argv>);
+	my Str $out = '';
+	my Str $err = '';
+	$proc.stdout.tap(-> $chunk { $out ~= $chunk }, quit => -> $ { });
+	$proc.stderr.tap(-> $chunk { $err ~= $chunk }, quit => -> $ { });
+	my $done = $proc.start;
+	await Promise.anyof($done, Promise.in(30));
+	my $ = try await $done;
+
+	is $out, '', 'the wrapped spawn wrote nothing to standard output';
+	# A shell would have run the echo and said so on stdout (asserted above),
+	# and would have complained about "ghost" alone.  What comes back instead
+	# is a failure to exec the whole literal string — or, on Windows, where
+	# nothing wraps and the name is not even a legal one, nothing at all.
+	ok $err.chars == 0 || $err.contains($evil),
+		'and the failure names the whole literal string, not a piece of it';
 };
 
 subtest 'Isolation.wrap and normalize-exit' => {

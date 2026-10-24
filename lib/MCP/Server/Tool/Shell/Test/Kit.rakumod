@@ -2,12 +2,22 @@ use Test;
 use JSON::Fast;
 use MCP::Server::Protocol;
 
-#| Shared fixtures for the Shell toolkit tests: the handle-request idiom every
-#| tool call is driven through, a recording notification sink for the streaming
-#| and job-push tests, and a poll-until helper so nothing has to guess at a
-#| sleep.  Deliberately does not `use MCP::Server::Tool::Shell` — t/04 loads the
-#| pack dynamically and must not have it pulled in behind its back.
-unit module ShellTest;
+#|( Shared fixtures for the Shell toolkit tests: the handle-request idiom
+    every tool call is driven through, a recording notification sink for
+    the streaming and job-push tests, and a poll-until helper so nothing
+    has to guess at a sleep.  Deliberately does not
+    `use MCP::Server::Tool::Shell` — t/04 loads the pack dynamically and
+    must not have it pulled in behind its back.
+
+    This is test support, not library surface -- it ships inside the dist's
+    own namespace (rather than under C<t/lib>) deliberately, so that
+    C<zef install>'s test phase precompiles it as part of C<lib/> staging
+    before any test file runs. A C<t/lib> CompUnit repo starts cold on a
+    fresh C<zef install> and races when parallel test files each pull in
+    the fixture's dependency chain, which can fail the install outright;
+    moving test support into C<lib/> under a C<::Test> namespace is the
+    fleet-wide fix for that failure class. )
+unit module MCP::Server::Tool::Shell::Test::Kit;
 
 #| Every command the suite runs is the running Raku interpreter itself: it is
 #| the one executable guaranteed to exist on macOS, Linux and Windows alike, and
