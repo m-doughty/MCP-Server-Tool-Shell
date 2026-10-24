@@ -2,6 +2,27 @@ Revision history for MCP::Server::Tool::Shell
 
 {{$NEXT}}
 
+0.4.3  2026-10-24T20:12:40+01:00
+    - [2026-10-24] BUGFIX: t/15 failed on Linux. Its Windows-rules tests put
+      wintool.exe on PATH with a PATHEXT of ".EXE", as a Windows system
+      usually has them, and the search asked the filesystem for
+      "wintool.EXE", which a case-sensitive filesystem does not have; a
+      macOS filesystem ignores case, so the tests passed there. Windows
+      matches a name on PATH without regard to case, and the search made
+      under its rules now does too, in two passes. Each name is asked for
+      exactly as it is spelt first, which on Windows' own filesystems is
+      already the whole answer; only when nothing answers is each PATH
+      directory read and its entries compared case-folded. The same
+      environment now gives the same answer on every host. t/15 pins it:
+      the extension, the name, and the PATH and PATHEXT spellings each
+      differ in case, and the near misses (another extension, a prefix, a
+      longer name, a directory, a PATH entry that is missing or is a file)
+      must not match.
+    - [2026-10-24] BUGFIX: t/11 failed on a host with no perl, Alpine for one.
+      Its fixture for "runs, but does not detach" was /usr/bin/perl, so the
+      refusal it checked for became one about the missing perl. The fixture
+      is now the running raku, which every host has.
+
 0.4.2  2026-10-24T18:52:13+01:00
     - [2026-10-24] BUGFIX: on Rakudo 2026.09 under macOS, the pack leaked a
       file descriptor every time it asked which platform it was on -- once

@@ -316,9 +316,11 @@ filesystem allows: C</Applications/My App/bin/tool> runs, and so does
 C<C:\Program Files (x86)\Git\cmd\git.exe>, parentheses and all. It is the
 platform's own resolution — a string containing a path separator (a slash, or
 on Windows a backslash or a drive letter) is a path, and anything else is
-looked for on C<PATH>, with C<PATHEXT> appended on Windows. A file is
-executable if it carries the execute bit on POSIX, and if it is simply there on
-Windows, which has no such bit and leaves the judgement to C<CreateProcess>.
+looked for on C<PATH>, with C<PATHEXT> appended on Windows. On Windows the
+name is matched without regard to case, as Windows matches it: C<wintool>, with
+C<.EXE> in C<PATHEXT>, finds C<wintool.exe>. A file is executable if it carries
+the execute bit on POSIX, and if it is simply there on Windows, which has no
+such bit and leaves the judgement to C<CreateProcess>.
 
 The second arm asks for the buried program by name rather than settling for
 "there is a space in here" on its own, which keeps two classes of call

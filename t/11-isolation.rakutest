@@ -439,12 +439,15 @@ subtest 'Resolution fails loudly rather than quietly unprotected' => {
 	unless IS-WIN {
 		# Present, runnable, and does not do the one thing it is there for: the
 		# check has to catch it, because nothing about the filesystem would.
+		# The running interpreter plays the part, being the one program every
+		# host is sure to have: a perl at a fixed path is not (Alpine ships
+		# none), and the refusal would then be about the missing perl instead.
 		dies-with {
 			build-isolation([
 				{
-					mechanism => 'perl',
-					names => ('perl',),
-					paths => ('/usr/bin/perl',),
+					mechanism => 'not-a-trampoline',
+					names => (),
+					paths => ($raku,),
 					args => ('-e', 'print "I am not a trampoline"'),
 					'failure-prefix' => 'x: ',
 					'failure-statuses' => (127,),

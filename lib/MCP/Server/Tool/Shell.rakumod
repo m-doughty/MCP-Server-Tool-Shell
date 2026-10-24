@@ -702,26 +702,57 @@ sub one-line(Str:D $text --> Str:D) {
 #| Does this exact string name a program this pack could spawn?  Asked only
 #| of a command that already looks like a command line, so an ordinary call
 #| never pays for it.
-sub names-executable(Str:D $command --> Bool:D) {
+#|
+#| Windows matches a name on PATH without regard to case: "wintool", with
+#| ".EXE" in PATHEXT, runs F<wintool.exe>.  Under its rules the search here
+#| does the same, in two passes.  The first asks for each name exactly as it
+#| is spelt, one stat apiece in every PATH directory; on Windows' own
+#| filesystems, which ignore case themselves, that is already the whole
+#| answer.  Only when nothing answers to the exact spelling is each directory
+#| read, and its entries compared with the names case-folded, so the answer
+#| no longer depends on whether the filesystem underneath ignores case: the
+#| same environment gives the same answer on every host.  POSIX names are
+#| exact.  A path is not searched for at all: it is asked for as written, and
+#| the filesystem it names answers.
+#| Exposed with C<our> scope for the tests — not part of the public API.
+our sub names-executable(Str:D $command --> Bool:D) {
 	return False unless $command.chars > 0;
 	my Bool:D $win = so $*DISTRO.is-win;
 
 	# Anything with a path separator in it is a path and is not looked for on
 	# PATH -- which is how exec reads it on both platforms.  On Windows that
 	# means a backslash or a drive letter as well as a slash.
-	return executable-file($command.IO)
+	return executable-file($command.IO, $win)
 		if $command.contains('/')
 		|| ($win && ($command.contains('\\') || $command ~~ / ^ <[A..Za..z]> ':' /));
 
-	my @exts = $win ?? windows-path-exts() !! ();
-	for (env-value('PATH') // '').split($win ?? ';' !! ':', :skip-empty) -> $dir {
-		next unless $dir.chars > 0;
-		my $candidate = $dir.IO.add($command);
-		return True if executable-file($candidate);
-		return True if @exts.first({ executable-file(($candidate.Str ~ $_).IO) }).defined;
+	my @names = $command, |($win ?? windows-path-exts().map({ $command ~ $_ }) !! ());
+	my @dirs = (env-value('PATH') // '').split($win ?? ';' !! ':', :skip-empty).map(*.IO);
+
+	for @dirs -> $dir {
+		return True if @names.first({ executable-file($dir.add($_), $win) }).defined;
+	}
+	return False unless $win;
+
+	my $wanted = @names.map(*.fc).Set;
+	for @dirs -> $dir {
+		return True if holds-folded-entry($dir, $wanted, $win);
 	}
 
 	False;
+}
+
+#| Does this directory hold an executable whose name, case-folded, is one of
+#| C<$wanted>?  Only names are compared while the directory is read; just
+#| the entries that match are asked whether they are files.  A directory that
+#| is missing or unreadable holds nothing, and must not throw out of a
+#| question asked while building an error message -- which is why the whole
+#| read, and not only the call that starts it, is inside the C<try>.
+sub holds-folded-entry(IO::Path:D $dir, Set:D $wanted, Bool:D $win --> Bool:D) {
+	my $answer = try so $dir.dir(test => { .fc (elem) $wanted })
+		.first({ executable-file($_, $win) })
+		.defined;
+	$answer // False;
 }
 
 #| An environment variable as the operating system reads it.  Windows names
@@ -747,9 +778,11 @@ our sub env-value(Str:D $name --> Str) {
 #| its refusal is an ordinary spawn failure -- so there the question is only
 #| whether the file is there.  A path the platform will not even stat (an
 #| illegal Windows filename, say) is not an executable, and must not throw out
-#| of a question asked while building an error message.
-sub executable-file(IO::Path:D $path --> Bool:D) {
-	my $answer = try so $path.f && ($*DISTRO.is-win || $path.x);
+#| of a question asked while building an error message.  C<$win> is the
+#| caller's one reading of the platform, so a search asks once, not once per
+#| file.
+sub executable-file(IO::Path:D $path, Bool:D $win --> Bool:D) {
+	my $answer = try so $path.f && ($win || $path.x);
 	$answer // False;
 }
 

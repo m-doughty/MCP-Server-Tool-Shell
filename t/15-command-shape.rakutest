@@ -18,7 +18,7 @@ use MCP::Server::Tool::Shell;
 # runs; and a binary that is genuinely missing still answers the way it always
 # has, in the payload rather than as an error result.
 
-plan 9;
+plan 10;
 
 my constant IS-WIN = $*DISTRO.is-win;
 
@@ -34,12 +34,18 @@ my $spacey = $work.add('my dir');
 $spacey.mkdir;
 my $winish = $work.add('win');
 $winish.mkdir;
+# The case-folding fixtures, with a directory among them whose name looks like
+# a program's.
+my $fold = $work.add('fold');
+$fold.mkdir;
+my $fold-dir = $fold.add('dirtool.exe');
+$fold-dir.mkdir;
 END {
 	try {
-		for ($bin, $spacey, $winish, $work) -> $dir {
+		for ($bin, $spacey, $winish, $fold, $work) -> $dir {
 			.unlink for $dir.dir.grep(*.f);
 		}
-		.rmdir for ($bin, $spacey, $winish, $work);
+		.rmdir for ($bin, $spacey, $winish, $fold-dir, $fold, $work);
 	}
 }
 
@@ -273,6 +279,12 @@ subtest 'The Windows arm of the resolver: no execute bit, PATHEXT and a ; PATH' 
 	# PATHEXT to a bare name.  Faking $*DISTRO runs that arm on every platform,
 	# the way t/14 runs the Windows kill branch: nothing is spawned here, since
 	# every call in this subtest is refused before it reaches a process.
+	#
+	# The file is "wintool.exe" and PATHEXT says ".EXE", as a real Windows
+	# system usually has them, and a Windows search ignores the difference.
+	# On a host whose filesystem ignores case too (macOS by default) the
+	# difference was never seen at all; on Linux the faked rules found nothing
+	# here until the search was made to fold case itself.
 	my $tool = $winish.add('wintool.exe');
 	$tool.spurt('not executable by any POSIX measure');
 
@@ -310,6 +322,71 @@ subtest 'The Windows arm of the resolver: no execute bit, PATHEXT and a ; PATH' 
 	my %native = call($server, 'sh_run', { command => 'wintool --flag', timeout => 30 });
 	is so %native<result><isError>, IS-WIN,
 		'and this platform applies its own answer to the same question';
+};
+
+# The same search asked of the resolver directly, so that a name which is NOT
+# found -- a call that would go on to spawn rather than be refused -- can be
+# pinned under the faked rules too, with nothing spawned.  Every scenario has
+# a file of its own: where the filesystem ignores case, "lower.exe" and
+# "LOWER.EXE" are one file, so a fixture that wrote both would be a different
+# fixture there than on Linux.
+subtest 'Under Windows rules a name on PATH is matched without regard to case' => {
+	plan 15;
+	my &names-executable = &MCP::Server::Tool::Shell::names-executable;
+	for <lower.exe UPPER.EXE Mixed.Exe decoy.exe.bak pathonly.exe> -> $name {
+		$fold.add($name).spurt('not executable by any POSIX measure');
+	}
+	my $here = $fold.absolute;
+	my $missing = $work.add('no-such-dir').absolute;
+	my $not-a-dir = $fold.add('lower.exe').absolute;
+
+	# Does $name resolve with exactly these variables, under exactly these
+	# spellings, standing in for PATH and PATHEXT?
+	my sub resolves(Str:D $name, *%vars --> Bool:D) {
+		my %*ENV = %*ENV.grep({ .key.fc ne 'path' && .key.fc ne 'pathext' });
+		%*ENV{.key} = .value for %vars;
+		names-executable($name);
+	}
+
+	my $*DISTRO = class { method is-win { True } }.new;
+
+	ok resolves('lower', PATH => $here, PATHEXT => '.EXE'),
+		'A PATHEXT of .EXE finds lower.exe';
+	ok resolves('UPPER', PATH => $here, PATHEXT => '.exe'),
+		'and one of .exe finds UPPER.EXE';
+	ok resolves('mixed', PATH => $here, PATHEXT => '.EXE'),
+		'The name itself is matched without regard to case as well (Mixed.Exe)';
+	ok resolves('LOWER.EXE', PATH => $here, PATHEXT => '.COM'),
+		'and so is a name that already carries its extension';
+	ok resolves('lower', PATH => $here, PATHEXT => '.COM;.Exe;.BAT'),
+		'Every PATHEXT entry is tried, not only the first';
+
+	nok resolves('lower', PATH => $here, PATHEXT => '.CMD;.BAT'),
+		'The extension has to match, not just the name in front of it';
+	nok resolves('lowe', PATH => $here, PATHEXT => '.EXE'),
+		'A prefix of a name is not that name';
+	nok resolves('decoy', PATH => $here, PATHEXT => '.EXE'),
+		'and nor is a name with more after it (decoy.exe.bak)';
+	nok resolves('dirtool', PATH => $here, PATHEXT => '.EXE'),
+		'A directory is not an executable, whatever it is called';
+
+	ok resolves('pathonly', Path => $here, PATHEXT => '.exe'),
+		'PATH is read when it is spelt "Path" and there is no PATH';
+	ok resolves('pathonly', PATH => $here, PathExt => '.exe'),
+		'and PATHEXT when it is spelt "PathExt"';
+
+	nok resolves('lower', PATH => $missing, PATHEXT => '.EXE'),
+		'A PATH entry that is not there holds nothing, and asking does not throw';
+	nok resolves('lower', PATH => $not-a-dir, PATHEXT => '.EXE'),
+		'nor does an entry that is a file rather than a directory';
+	ok resolves('lower', PATH => ($missing, $not-a-dir, $here).join(';'), PATHEXT => '.EXE'),
+		'and neither stops the search reaching the directory after them';
+
+	{
+		my $*DISTRO = class { method is-win { False } }.new;
+		nok resolves('lower', PATH => $here, PATHEXT => '.EXE'),
+			'Under POSIX rules nothing appends PATHEXT';
+	}
 };
 
 # An MSYS or Cygwin parent hands a Windows process both PATH and Path, and a

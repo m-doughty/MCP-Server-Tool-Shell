@@ -55,11 +55,11 @@ unit module MCP::Server::Tool::Shell::Isolation;
 # build runs sw_vers and leaves the pipe it read the answer from open, so
 # every read costs a process and a file descriptor that is never given back
 # -- and so does every $*KERNEL.name, which asks $*DISTRO for its answer.
-# This pack asks $*DISTRO once for every PATH entry a command-shape check
-# looks in, for every environment variable it reads and for every kill, so a
-# long-running host at macOS's default limit of 256 descriptors ran out:
-# commands could no longer be spawned, and then nothing could be opened at
-# all.  Filing the object under the key the lookup reads makes it the one
+# This pack asked $*DISTRO once for every PATH entry a command-shape check
+# looked in, and it still asks for every check, every environment variable it
+# reads and every kill, so a long-running host at macOS's default limit of 256
+# descriptors ran out: commands could no longer be spawned, and then nothing
+# could be opened at all.  Filing the object under the key the lookup reads makes it the one
 # every later read returns, as on every other release; where the key is
 # already there, which is everywhere the bug is not, nothing is filed.  It is
 # done here because every module in the pack that reads $*DISTRO loads this
