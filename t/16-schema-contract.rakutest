@@ -14,7 +14,7 @@ use MCP::Server::Tool::Shell;
 # -- and every claim below is checked against the handler rather than against
 # the registration.
 
-plan 6;
+plan 7;
 
 my $raku = raku-path();
 
@@ -133,6 +133,18 @@ subtest 'omitting args is exactly an empty argv vector' => {
 	is-deeply tool-schema($server, 'sh_start')<properties><args><default>,
 		tool-schema($server, 'sh_run')<properties><args><default>,
 		'and "start" publishes the same default, from the same parameter block';
+};
+
+subtest 'args publishes its item schema' => {
+	plan 2;
+
+	# Both tools share one parameter declaration and publish its item type.
+	is-deeply tool-schema($server, 'sh_run')<properties><args><items>,
+		%( type => 'string' ),
+		'run publishes that every args entry is a string';
+	is-deeply tool-schema($server, 'sh_start')<properties><args><items>,
+		%( type => 'string' ),
+		'and start publishes the same, from the same parameter block';
 };
 
 subtest 'the timeout a run falls back to is the one published' => {

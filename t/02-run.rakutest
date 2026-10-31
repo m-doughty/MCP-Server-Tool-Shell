@@ -4,7 +4,7 @@ use JSON::Fast;
 use MCP::Server;
 use MCP::Server::Tool::Shell;
 
-plan 12;
+plan 13;
 
 # Every command run here is the running Raku interpreter itself: it is the one
 # executable guaranteed to exist on macOS, Linux and Windows alike, and driving
@@ -149,6 +149,48 @@ subtest 'Argument validation' => {
 		ok $matched, "Rejected: $needle";
 		diag "got: {text(%response)}" unless $matched;
 	}
+};
+
+subtest 'Unknown run arguments are refused before spawning' => {
+	plan 21;
+	my $dir = $*TMPDIR.add("mcp-shell-unknown-run-{$*PID}-{now.Int}");
+	$dir.mkdir;
+	LEAVE {
+		.unlink for $dir.dir;
+		$dir.rmdir;
+	}
+
+	my @cases =
+		%( argv => ['-e', 'print 1'] ),
+		%( argz => [] ),
+		%( zebra => False, extra => 'value' ),
+		%( reason => 'explain the call' ),
+	;
+	for @cases.kv -> $index, %extra {
+		my $marker = $dir.add("marker-$index");
+		my %response = call($server, 'sh_run', {
+			command => $raku,
+			args => ['-e', 'spurt @*ARGS[0], "spawned"', $marker.Str],
+			|%extra,
+		});
+		ok errored(%response), "Unknown run keys {%extra.keys.sort.join(', ')} are refused";
+		for %extra.keys -> $key {
+			ok text(%response).contains("'$key'"), "The error names '$key'";
+		}
+		ok text(%response).contains('command, args, cwd, stdin, timeout'),
+			'The error lists the accepted arguments';
+		nok $marker.e, 'The rejected call did not spawn its marker-writing program';
+		ok text(%response).contains("Arguments go in 'args'"),
+			'The argv refusal teaches the args spelling' if %extra<argv>:exists;
+	}
+
+	my %valid = run-ok($server, {
+		command => $raku,
+		args => ['-e', 'print @*ARGS[0] ~ ":" ~ $*IN.slurp', 42],
+		cwd => $dir.Str, stdin => 'input', timeout => 10,
+	}, 'all accepted run arguments');
+	is %valid<stdout>, '42:input', 'Valid keys and numeric argument coercion still work';
+	is %valid<exit>, 0, 'The valid command succeeds';
 };
 
 subtest 'The allowed tool lists the allow list' => {

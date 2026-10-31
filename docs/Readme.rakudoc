@@ -214,6 +214,12 @@ stdin    | string          | no       | Text to write to standard input, then cl
 timeout  | number          | no       | Seconds, overriding the server default
 =end table
 
+The C<args> schema declares string items for both C<run> and C<start>.
+Both tools refuse unknown argument keys before spawning a process.
+The accepted keys are C<command>, C<args>, C<cwd>, C<stdin> and C<timeout>.
+Use C<args>, not C<argv>, for the argument vector.
+This applies to every MCP client calling these tools.
+
 The result is a JSON object as text content:
 
 =begin code :lang<json>

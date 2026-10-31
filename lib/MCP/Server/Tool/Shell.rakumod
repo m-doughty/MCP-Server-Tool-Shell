@@ -319,6 +319,7 @@ method !run-params(Str:D $what, Real :$timeout-default --> Hash) {
 		},
 		args => {
 			type => 'array',
+			items => { type => 'string' },
 			description => 'Every argument to the command, one array entry per '
 			  ~ 'argument: "git status -s" is ["status", "-s"].  This is where '
 			  ~ 'arguments belong — never appended to "command" — because the '
@@ -511,10 +512,22 @@ method !kill(%args --> Str:D) {
 
 # === Argument validation ===
 
+my constant RUN-KEYS = <command args cwd stdin timeout>;
+
 #| Everything "run" and "start" agree on: the command, its argv vector, the
 #| working directory and the standard input, all checked before anything is
-#| spawned.
+#| spawned. Unknown argument keys are refused.
 method !validate(%args --> Hash) {
+	my @unknown = %args.keys.grep({ $_ !(elem) RUN-KEYS }).sort;
+	if @unknown.elems {
+		my $message = 'Unknown parameters: '
+			~ @unknown.map({ "'$_'" }).join(', ')
+			~ '. Accepted parameters: ' ~ RUN-KEYS.join(', ') ~ '.';
+		$message ~= " Arguments go in 'args', not 'argv'."
+			if @unknown.first(* eq 'argv').defined;
+		die $message;
+	}
+
 	my $command = %args<command>;
 	die "'command' is required and must be a non-empty string"
 		unless $command ~~ Str:D && $command.chars > 0;

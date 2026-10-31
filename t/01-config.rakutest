@@ -205,7 +205,7 @@ subtest 'default-prefix' => {
 };
 
 subtest 'Tool schemas' => {
-	plan 12;
+	plan 13;
 	my $server = MCP::Server.new(:name<schema>);
 	$server.plug: MCP::Server::Tool::Shell.new(allow => ['git']);
 
@@ -213,6 +213,8 @@ subtest 'Tool schemas' => {
 	is-deeply %run<required>.sort.list, ('command',), 'Only command is required on run';
 	is %run<properties><command><type>, 'string', 'command is a string';
 	is %run<properties><args><type>, 'array', 'args is an array';
+	is-deeply %run<properties><args><items>, %( type => 'string' ),
+		'args says its entries are strings';
 	is %run<properties><cwd><type>, 'string', 'cwd is a string';
 	is %run<properties><stdin><type>, 'string', 'stdin is a string';
 	is %run<properties><timeout><type>, 'number', 'timeout is a number';

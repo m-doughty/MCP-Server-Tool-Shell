@@ -8,7 +8,7 @@ use MCP::Server::Tool::Shell;
 # that outlives the tool call which started it, so every wait is a wait-until
 # with a generous bound rather than a sleep of a guessed length.
 
-plan 11;
+plan 12;
 
 my $raku = raku-path();
 
@@ -243,6 +243,57 @@ subtest 'A job whose command cannot be spawned reports it, and frees its slot' =
 
 	json-ok($server, 'sh_start', { command => $raku, args => ['-e', 'print 1'] },
 		'The slot it never really occupied is free');
+};
+
+subtest 'Unknown start arguments are refused before allocating a job' => {
+	plan 23;
+	my $server = shell-server;
+	my $dir = $*TMPDIR.add("mcp-shell-unknown-start-{$*PID}-{now.Int}");
+	$dir.mkdir;
+	LEAVE {
+		.unlink for $dir.dir;
+		$dir.rmdir;
+	}
+
+	my @cases =
+		%( argv => ['-e', 'print 1'] ),
+		%( argz => [] ),
+		%( zebra => False, extra => 'value' ),
+		%( reason => 'explain the call' ),
+	;
+	for @cases.kv -> $index, %extra {
+		my $marker = $dir.add("marker-$index");
+		my %response = call($server, 'sh_start', {
+			command => $raku,
+			args => ['-e', 'spurt @*ARGS[0], "spawned"', $marker.Str],
+			|%extra,
+		});
+		# On the original implementation, wait for the wrongly admitted job
+		# before checking the marker, so this assertion cannot win a spawn race.
+		unless errored(%response) {
+			my %job = from-json(text(%response));
+			finished($server, %job<job>);
+		}
+		ok errored(%response), "Unknown start keys {%extra.keys.sort.join(', ')} are refused";
+		for %extra.keys -> $key {
+			ok text(%response).contains("'$key'"), "The error names '$key'";
+		}
+		ok text(%response).contains('command, args, cwd, stdin, timeout'),
+			'The error lists the accepted arguments';
+		nok $marker.e, 'The rejected call did not spawn its marker-writing program';
+		ok text(%response).contains("Arguments go in 'args'"),
+			'The argv refusal teaches the args spelling' if %extra<argv>:exists;
+	}
+
+	my %valid = json-ok($server, 'sh_start', {
+		command => $raku,
+		args => ['-e', 'print @*ARGS[0] ~ ":" ~ $*IN.slurp', 42],
+		cwd => $dir.Str, stdin => 'input', timeout => 10,
+	}, 'all accepted start arguments');
+	ok %valid<job>.starts-with('j1-'), 'Rejected calls allocated no job handles';
+	ok finished($server, %valid<job>), 'The valid job finishes';
+	my %output = json-ok($server, 'sh_output', { job => %valid<job> }, 'valid output');
+	is %output<stdout>, '42:input', 'Valid keys and numeric argument coercion still work';
 };
 
 subtest 'Jobs nobody has heard of' => {

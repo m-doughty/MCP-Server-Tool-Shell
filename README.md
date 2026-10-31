@@ -159,6 +159,8 @@ Runs one command in the foreground and waits for it.
 </tbody>
 </table>
 
+The `args` schema declares string items for both `run` and `start`. Both tools refuse unknown argument keys before spawning a process. The accepted keys are `command`, `args`, `cwd`, `stdin` and `timeout`. Use `args`, not `argv`, for the argument vector. This applies to every MCP client calling these tools.
+
 The result is a JSON object as text content:
 
 ```json
