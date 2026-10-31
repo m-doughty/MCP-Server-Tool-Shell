@@ -2,6 +2,14 @@ Revision history for MCP::Server::Tool::Shell
 
 {{$NEXT}}
 
+0.4.4  2026-10-31T16:50:17Z
+    - [2026-10-31] Publish string item schemas for the "args" arrays of
+      "run" and "start". Requires MCP::Server 0.7.2 or later.
+    - [2026-10-31] BREAKING: "run" and "start" now refuse unknown argument
+      keys before spawning. Every MCP client sending extra keys receives
+      an isError result naming the keys and accepted parameters. An "argv"
+      key is refused with guidance to use "args" instead.
+
 0.4.3  2026-10-24T20:12:40+01:00
     - [2026-10-24] BUGFIX: t/15 failed on Linux. Its Windows-rules tests put
       wintool.exe on PATH with a PATHEXT of ".EXE", as a Windows system
