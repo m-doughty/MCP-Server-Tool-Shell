@@ -34,8 +34,8 @@ use MCP::Server::Tool::Shell::Isolation;
 #| A job does not observe the cancellation of the request that started it: that
 #| request was answered the moment the job was handed its id, and its stream
 #| closing afterwards is the normal course of events rather than a signal to
-#| kill anything.  Stopping a job is explicit — the C<kill> tool, or its own
-#| optional timeout.
+#| kill anything. A job stops through the C<kill> tool, its optional timeout,
+#| or toolkit shutdown.
 unit module MCP::Server::Tool::Shell::Jobs;
 
 # How often a running job's pending output is pushed to the client.  Jobs are
@@ -152,6 +152,55 @@ sub apply-launcher(&launcher, Str:D $command, @argv, IO::Path $dir --> Hash) is 
 	%( command => $cmd, argv => @wrapped-argv.List, sandboxed => so %wrapped<sandboxed> );
 }
 
+# The completion belongs to the job, so shutdown can also await a kill that
+# another caller already requested. Readiness and taskkill share this bound;
+# the final direct kill leaves time for the watcher to settle.
+my sub tree-kill-work($proc, Bool:D :$group = False, Promise :$done --> Promise:D) {
+	my $windows = $*DISTRO.is-win;
+	start {
+		my $deadline = now + 4;
+		my Str $error;
+		{
+			CATCH { default { $error = .message } }
+			my $ready = $proc.pid;
+			await Promise.anyof($ready, Promise.in(max(0, ($deadline - now).Num)));
+			if $ready.status ~~ Planned {
+				die 'Process did not become ready within the tree-kill bound';
+			}
+			elsif $ready.status ~~ Broken {
+				my $ = $ready.cause;
+			}
+			elsif !$done.defined || $done.status ~~ Planned {
+				my $pid = process-pid($proc);
+				if $windows && $pid.defined {
+					my $tk = Proc::Async.new('taskkill', '/T', '/F', '/PID', $pid.Str);
+					$tk.stdout.tap(-> $ {}, quit => -> $ {});
+					$tk.stderr.tap(-> $ {}, quit => -> $ {});
+					my $task = $tk.start;
+					$task.then(-> $finished { my $ = try $finished.result });
+					await Promise.anyof($task, Promise.in(max(0, ($deadline - now).Num)));
+					if $task.status ~~ Planned {
+						try $tk.kill(Signal::SIGKILL);
+						await Promise.anyof($task, Promise.in(0.25));
+						die 'taskkill did not complete within the tree-kill bound';
+					}
+					if $task.status ~~ Broken { die $task.cause }
+					my $result = $task.result;
+					die "taskkill failed with exit {$result.exitcode}"
+						if $result.exitcode != 0 && (!$done.defined || $done.status ~~ Planned);
+				}
+				elsif $group && $pid.defined {
+					kill-process-group($pid);
+				}
+			}
+		}
+		# Always attempt the direct child after the tree operation, including
+		# a failed or unavailable taskkill. No catchable signal precedes it.
+		try $proc.kill(Signal::SIGKILL);
+		$error.defined ?? %( ok => False, :$error ) !! %( ok => True );
+	}
+}
+
 #| Kill C<$proc> and, as far as the platform allows, the whole process tree
 #| beneath it.
 #|
@@ -162,8 +211,8 @@ sub apply-launcher(&launcher, Str:D $command, @argv, IO::Path $dir --> Hash) is 
 #| =item B<Windows> — C<taskkill /T /F /PID> walks the tree.  It is chosen over
 #|       a C<Job-Object> C<NativeCall> binding for portability: it needs no
 #|       per-OS shared library, ships with every Windows, and this pack shells
-#|       out to nothing else, so a one-shot fire-and-forget C<taskkill> is the
-#|       smaller surface than an AssignProcessToJobObject dance done at every
+#|       out to nothing else. Its worker waits for bounded completion before
+#|       direct-child fallback, without blocking the caller or adding bindings at every
 #|       spawn.
 #| =item B<POSIX, with C<:group>> — C<SIGKILL> to the child's process I<group>,
 #|       which a terminal-isolated child leads (see
@@ -175,31 +224,12 @@ sub apply-launcher(&launcher, Str:D $command, @argv, IO::Path $dir --> Hash) is 
 #| whole story for a child with no descendants, and the backstop for a stripped
 #| Windows image with no C<taskkill> — and the watcher collects the exit status
 #| either way.
-sub kill-process-tree($proc, Bool:D :$group = False --> Nil) is export {
-	my $pid = process-pid($proc);
-
-	if $*DISTRO.is-win {
-		with $pid {
-			# Fire-and-forget: best-effort, and never blocks the caller (the
-			# handler thread on a "kill" tool call, or the foreground loop on a
-			# timeout).  Its own output is discarded.
-			my $tk = Proc::Async.new('taskkill', '/T', '/F', '/PID', .Str);
-			# -> $ {}, not {}: a bare {} in argument position is an empty
-			# Hash, and tap's first positional is the &emit Callable.
-			$tk.stdout.tap(-> $ {}, quit => -> $ {});
-			$tk.stderr.tap(-> $ {}, quit => -> $ {});
-			try $tk.start;
-		}
-	}
-	elsif $group {
-		kill-process-group($_) with $pid;
-	}
-
-	# SIGKILL the direct child unconditionally: it is what settles the start
-	# promise, and neither of the tree kills above is guaranteed to have reached
-	# the child itself (a pid that was not known yet, a missing taskkill).
-	try $proc.kill(Signal::SIGKILL);
-	Nil;
+#| Supplying the existing C<:done> promise avoids tree signals after known
+#| completion. This wrapper returns immediately; jobs retain the worker's
+#| completion separately for toolkit shutdown.
+sub kill-process-tree($proc, Bool:D :$group = False, Promise :$done --> Nil) is export {
+	my $work = tree-kill-work($proc, :$group, :$done);
+	$work.then(-> $finished { my $ = try $finished.result });
 }
 
 #| One background command.
@@ -278,6 +308,11 @@ class Job {
 	has Int $!exit;
 	has Bool:D $!timed-out = False;
 	has Bool:D $!kill-requested = False;
+	has Promise $!settlement .= new;
+	has Promise $!cleanup .= new;
+	has Bool:D $!cleanup-complete = False;
+	has Promise $!announcement .= new;
+	has Promise $!kill-work;
 	has Instant $!started-at;
 	has Instant $!finished-at;
 	has $!flusher;
@@ -294,12 +329,16 @@ class Job {
 	#| process.  A command that merely fails to execute is not this — that is a
 	#| broken start promise, and it lands in the payload as exit -1.
 	method spawn(--> Nil) {
+		my $flusher;
 		CATCH {
 			default {
+				$flusher.close with $flusher;
 				self!abort("Could not start the command: {.message}");
 				.rethrow;
 			}
 		}
+
+		return unless $!lock.protect({ $!state eq 'running' });
 
 		# The sandbox/launcher wrapper, applied right before the process is
 		# built.  A launcher that throws (or hands back an unspawnable shape) is
@@ -347,15 +386,27 @@ class Job {
 
 		# Armed before the process so that a command which exits immediately
 		# cannot finish (and close the flusher) before the flusher exists.
-		$!flusher = Supply.interval(FLUSH-INTERVAL).tap({ self!flush });
+		$flusher = Supply.interval(FLUSH-INTERVAL).tap({ self!flush });
 
-		my $done = $proc.start(|(cwd => .absolute with $!dir));
-		$!lock.protect: {
-			$!proc = $proc;
-			$!done = $done;
-			$!started-at = now;
-			$!sandboxed = %launch<sandboxed>;
+		my Promise $done;
+		my $started = $!lock.protect: {
+			if $!state eq 'running' && !$!kill-requested {
+				$!flusher = $flusher;
+				$done = $proc.start(|(cwd => .absolute with $!dir));
+				$!proc = $proc;
+				$!done = $done;
+				$!started-at = now;
+				$!sandboxed = %launch<sandboxed>;
+				True;
+			}
+			else { False }
+		};
+		unless $started {
+			$flusher.close;
+			return;
 		}
+		# Install the watcher before any callback can synchronously shut down.
+		$done.then({ self!finish });
 
 		with $!stdin {
 			# Detached on purpose: a child that never reads its standard input
@@ -372,20 +423,15 @@ class Job {
 			try $proc.close-stdin;
 		}
 
-		# Both halves of the same announcement: the line a human reads and the
-		# event a program acts on.  The prose one first and unchanged — clients
-		# on a transport have been reading it since jobs existed.
-		self!push('info', "[{$!id}] started: {$!command}");
-		# Runtime zero rather than a measured microsecond: the job has just
-		# started, and an event whose shape changes with the clock is a nuisance
-		# to whoever renders it.
-		self!push-event('started', runtime => 0);
-
-		# The optional budget.  A job that has already finished shrugs this off:
-		# kill is a no-op once the state is terminal.
 		with $!timeout { Promise.in($_).then({ self.kill(:timed-out) }) }
 
-		$done.then({ self!finish });
+		# Terminal state and settlement never wait for this callback. Its
+		# separate barrier only preserves started-before-terminal event order.
+		{
+			LEAVE $!announcement.keep(True);
+			self!push('info', "[{$!id}] started: {$!command}");
+			self!push-event('started', runtime => 0);
+		}
 	}
 
 	#| Kill the command with C<SIGKILL>, idempotently, and return whether a kill
@@ -393,36 +439,70 @@ class Job {
 	#| the watcher's job, so poll for the final state.  A job that has already
 	#| finished is left alone.
 	#|
-	#| Only meaningful once L<#method spawn> has been called — which the toolkit
-	#| does before the job's handle is given out, so no caller of the tools can
-	#| reach a job that has nothing to kill.
+	#| Before a process exists, cancellation makes the job terminal without
+	#| spawning it. A launcher already running may return, but cannot spawn.
 	method kill(Bool:D :$timed-out = False --> Bool:D) {
-		my $proc;
-		my Bool $issue = False;
-
+		my ($proc, $done, $work);
+		my Bool $cancelled = False;
 		$!lock.protect: {
 			if $!state eq 'running' {
 				$!timed-out = True if $timed-out;
-				$issue = !$!kill-requested;
-				$!kill-requested = True;
-				$proc = $!proc;
+				unless $!kill-requested {
+					$!kill-requested = True;
+					if $!proc.defined {
+						$proc = $!proc;
+						$done = $!done;
+						$work = $!kill-work = Promise.new;
+					}
+					else {
+						$!state = 'killed';
+						$!finished-at = now;
+						$cancelled = True;
+					}
+				}
 			}
 		}
-
-		if $issue && $proc.defined {
-			# SIGKILL straight away rather than TERM-then-KILL: Rakudo ignores
-			# every .kill after the first on a given Proc::Async, so a catchable
-			# signal first would leave no way to escalate against a child that
-			# traps it.  SIGKILL is also the portable choice -- on Windows it is
-			# one of the three signals libuv maps onto TerminateProcess.  The
-			# whole process tree goes with it (see kill-process-tree): on
-			# Windows always, and on POSIX whenever the job was given a session
-			# (and so a process group) of its own.  Grandchildren a job spawned
-			# would otherwise outlive the kill and hold its pipes open.
-			kill-process-tree($proc, group => $!isolation.new-session);
+		if $cancelled {
+			$!settlement.keep(True);
+			self!complete-cleanup;
+			# A launcher may still be on its caller's stack. No callback here
+			# may make shutdown wait for that same stack to return.
+			start {
+				self!push('info', "[{$!id}] killed before starting");
+				self!push-event('killed', runtime => 0);
+				&!on-finish() with &!on-finish;
+			}
 		}
-
+		if $work.defined {
+			my $operation = tree-kill-work($proc, done => $done, group => $!isolation.new-session);
+			$operation.then(-> $finished {
+				my %result;
+				{
+					CATCH { default { %result = ok => False, error => .message } }
+					%result = $finished.result;
+				}
+				$work.keep(%result);
+				self!complete-cleanup;
+			});
+		}
 		$!lock.protect: { $!kill-requested };
+	}
+
+	# Cleanup facts used by the toolkit's shared shutdown deadline.
+	method settlement(--> Promise:D) { $!settlement }
+	method kill-work(--> Promise) { $!lock.protect: { $!kill-work } }
+	method cleanup(--> Promise:D) { $!cleanup }
+
+	method !complete-cleanup(--> Nil) {
+		my $keep = $!lock.protect: {
+			if !$!cleanup-complete && $!settlement.status ~~ Kept
+				&& (!$!kill-work.defined || $!kill-work.status !~~ Planned) {
+				$!cleanup-complete = True;
+				True;
+			}
+			else { False }
+		};
+		$!cleanup.keep(True) if $keep;
 	}
 
 	#| Has the job reached a terminal state?
@@ -535,9 +615,11 @@ class Job {
 			}
 		}
 		return unless $mine;
+		$flusher.close with $flusher;
+		$!settlement.keep(True);
+		self!complete-cleanup;
 
 		self!capture('stderr', $why);
-		$flusher.close with $flusher;
 		self!flush;
 		self!push('info', "[{$!id}] failed to start: $why");
 
@@ -579,6 +661,10 @@ class Job {
 			}
 		}
 		return unless $mine;
+		$flusher.close with $flusher;
+		$!settlement.keep(True);
+		self!complete-cleanup;
+		await $!announcement;
 
 		# The spawn failure is output as far as the caller is concerned, so it
 		# goes through the same path as everything else the command "wrote" --
@@ -586,7 +672,6 @@ class Job {
 		self!capture('stderr', "\n") if $spawn-error.defined && $!stderr.stats<bytes> > 0;
 		self!capture('stderr', $spawn-error) if $spawn-error.defined;
 
-		$flusher.close with $flusher;
 		self!flush;
 
 		my %state = self.status;
@@ -631,6 +716,7 @@ class Registry {
 	has Lock $!lock .= new;
 	has %!jobs;
 	has Int:D $!counter = 0;
+	has Bool:D $!closed = False;
 
 	submethod TWEAK {
 		die "Shell toolkit job-ttl must be greater than zero seconds, got $!ttl"
@@ -651,7 +737,8 @@ class Registry {
 		# not a registry full at all.
 		self.reap;
 
-		$!lock.protect: {
+		my $job = $!lock.protect: {
+			die 'Shell toolkit has been shut down; background jobs are closed' if $!closed;
 			my Job @running = %!jobs.values.grep({ !.finished });
 			if @running.elems >= $!max-jobs {
 				Job;
@@ -661,6 +748,17 @@ class Registry {
 				%!jobs{$id} = $job;
 				$job;
 			}
+		};
+		$job.cleanup.then({ self.reap }) if $job.defined;
+		$job;
+	}
+
+	# Close and snapshot under the same lock used by admission. Killing and
+	# waiting are the caller's work, after releasing this lock.
+	method close(--> List:D) {
+		$!lock.protect: {
+			$!closed = True;
+			%!jobs.values.List;
 		}
 	}
 
@@ -692,11 +790,11 @@ class Registry {
 			# Collected into arrays first: deleting from a hash while iterating
 			# its own lazily-produced values is not safe.
 			my Job @dead = %!jobs.values.grep({
-				.finished && (.finished-at // now) < $cutoff
+				.finished && .cleanup.status ~~ Kept && (.finished-at // now) < $cutoff
 			});
 			%!jobs{.id}:delete for @dead;
 
-			my Job @kept = %!jobs.values.grep({ .finished }).sort(*.finished-at);
+			my Job @kept = %!jobs.values.grep({ .finished && .cleanup.status ~~ Kept }).sort(*.finished-at);
 			my Int $excess = @kept.elems - $!max-finished;
 			if $excess > 0 {
 				%!jobs{.id}:delete for @kept.head($excess);

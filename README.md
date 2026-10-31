@@ -354,13 +354,35 @@ Takes `job`, kills it with `SIGKILL` and returns `{ job, state, killed } ` immed
 
   * At most `max-jobs` run at once.
 
-  * A finished job stays pollable for `job-ttl` seconds, and only the `max-finished-jobs` most recently finished are kept. After that its handle is refused with a message saying why — start a new job rather than hoping.
+  * A finished job stays pollable for `job-ttl` seconds, and only the `max-finished-jobs` most recently finished are kept. After that its handle is refused with a message saying why — start a new job rather than hoping. Records awaiting tree cleanup remain available until that cleanup settles.
 
   * A job does **not** observe the cancellation of the request that started it: that request was answered the moment the handle was minted. Stopping a job is explicit, or its own `timeout`.
 
-  * Jobs die with the server process. Nothing here survives a restart.
+  * Jobs are terminated on explicit toolkit shutdown or clean process exit. An abrupt exit that cannot run cleanup can leave jobs running. Job handles are not persisted or recoverable after a restart.
 
   * Job ids (`j3-1x9k2w`) are handles, not secrets: anyone who can call these tools can already start jobs of their own.
+
+### Toolkit shutdown
+
+Keep a reference to the toolkit and call `shutdown` when its owner closes:
+
+```raku
+use MCP::Server;
+use MCP::Server::Tool::Shell;
+
+my $kit = MCP::Server::Tool::Shell.new(allow => ['git']);
+my $server = MCP::Server.new(:name<workspace>);
+$server.plug: $kit;
+$kit.shutdown;
+```
+
+`shutdown` atomically closes background job admission and requests every owned job's termination. Concurrent and repeated calls share the same completion. All jobs share one five-second deadline for tree cleanup and terminal state. Cleanup failure throws rather than reporting success. Failed shutdowns remain tracked for the exit backstop. Existing records remain available to `poll` and `output` under the usual retention policy; new `start` calls are refused.
+
+Foreground `run` calls keep their existing timeout and request-cancellation behavior. `shutdown` does not stop foreground calls or close their admission. Background jobs still outlive the individual requests that started them.
+
+A clean process exit also attempts shutdown for every remaining toolkit, reporting failures while continuing with the others. Explicit shutdown releases the toolkit's retained exit-backstop reference. No cleanup can run after `SIGKILL`, a crash, or an unhandled terminating signal; jobs may then survive.
+
+Tree coverage follows the existing kill policy: Windows uses `taskkill /T /F`; POSIX uses the job's process group when terminal isolation is enabled. With `isolate-terminal = False` on POSIX, only the direct child is covered.
 
 ### Push notifications, honestly
 
@@ -527,7 +549,7 @@ The launcher does not see, and cannot change, the working directory, the timeout
 
   * A kill becomes `TerminateProcess`, which the command cannot trap or delay. There are no signals, so there is no `128 + signal` exit status: a killed run or job reports whatever `TerminateProcess` left behind (`1`, in practice). Test for `exit != 0` rather than for `137`.
 
-  * A kill takes the **whole process tree**: `taskkill /T /F /PID` is issued against the child before the `TerminateProcess` backstop, so grandchildren the command spawned do not outlive the kill. It is fire-and-forget — the watcher collects the exit status independently — and if `taskkill` is missing from a stripped image the direct-child kill still runs. (Unix reaches the tree a different way, by signalling the process group of an isolated child; see [Terminal isolation](#Terminal isolation).)
+  * A kill targets the **whole process tree**: `taskkill /T /F /PID` is issued against the child before the `TerminateProcess` backstop, so grandchildren the command spawned are included. The worker waits for bounded `taskkill` completion before attempting a direct-child fallback. The kill tool returns immediately; toolkit shutdown also waits for this cleanup. If `taskkill` is missing from a stripped image, the direct-child kill still runs and shutdown reports the tree-cleanup failure. (Unix reaches the tree a different way, by signalling the process group of an isolated child; see [Terminal isolation](#Terminal isolation).)
 
   * `isolate-terminal` detaches standard input here as it does everywhere, but there is no session to leave and no `/dev/tty` to close off: Windows has neither, so the pack claims neither. See [Terminal isolation](#Terminal isolation).
 

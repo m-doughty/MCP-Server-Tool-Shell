@@ -374,9 +374,8 @@ sub kill-process-group(Int:D $pid --> Bool:D) is export {
 #| C<$proc>'s pid, or an undefined C<Int> when it is not known yet.  Never
 #| blocks: C<Proc::Async.pid> is a B<Promise>, and every caller here is on a
 #| thread (a handler answering a kill, a foreground run against its deadline)
-#| that must not wait on one.  An unkept pid means the process was spawned
-#| microseconds ago and cannot yet have descendants, so the direct kill every
-#| caller also issues is the whole story.
+#| that must not wait on one. An unkept pid is not observable yet; it says
+#| nothing about descendants. Asynchronous tree cleanup waits for readiness.
 sub process-pid($proc --> Int) is export {
 	my $promise = try $proc.pid;
 	return Int unless $promise ~~ Promise:D;

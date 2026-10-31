@@ -510,12 +510,49 @@ not an error.
 =item A finished job stays pollable for C<job-ttl> seconds, and only the
 C<max-finished-jobs> most recently finished are kept. After that its handle is
 refused with a message saying why — start a new job rather than hoping.
+Records awaiting tree cleanup remain available until that cleanup settles.
 =item A job does B<not> observe the cancellation of the request that started it:
 that request was answered the moment the handle was minted. Stopping a job is
 explicit, or its own C<timeout>.
-=item Jobs die with the server process. Nothing here survives a restart.
+=item Jobs are terminated on explicit toolkit shutdown or clean process exit.
+An abrupt exit that cannot run cleanup can leave jobs running.
+Job handles are not persisted or recoverable after a restart.
 =item Job ids (C<j3-1x9k2w>) are handles, not secrets: anyone who can call these
 tools can already start jobs of their own.
+
+=head3 Toolkit shutdown
+
+Keep a reference to the toolkit and call C<shutdown> when its owner closes:
+
+=begin code :lang<raku>
+use MCP::Server;
+use MCP::Server::Tool::Shell;
+
+my $kit = MCP::Server::Tool::Shell.new(allow => ['git']);
+my $server = MCP::Server.new(:name<workspace>);
+$server.plug: $kit;
+$kit.shutdown;
+=end code
+
+C<shutdown> atomically closes background job admission and requests every owned
+job's termination. Concurrent and repeated calls share the same completion.
+All jobs share one five-second deadline for tree cleanup and terminal state.
+Cleanup failure throws rather than reporting success. Failed shutdowns remain
+tracked for the exit backstop. Existing records remain available to C<poll>
+and C<output> under the usual retention policy; new C<start> calls are refused.
+
+Foreground C<run> calls keep their existing timeout and request-cancellation
+behavior. C<shutdown> does not stop foreground calls or close their admission.
+Background jobs still outlive the individual requests that started them.
+
+A clean process exit also attempts shutdown for every remaining toolkit,
+reporting failures while continuing with the others. Explicit shutdown releases
+the toolkit's retained exit-backstop reference. No cleanup can run after
+C<SIGKILL>, a crash, or an unhandled terminating signal; jobs may then survive.
+
+Tree coverage follows the existing kill policy: Windows uses C<taskkill /T /F>;
+POSIX uses the job's process group when terminal isolation is enabled.
+With C<isolate-terminal = False> on POSIX, only the direct child is covered.
 
 =head3 Push notifications, honestly
 
@@ -819,11 +856,13 @@ C<CreateProcess>, so an argument containing spaces stays one argument.
 delay. There are no signals, so there is no C<128 + signal> exit status: a
 killed run or job reports whatever C<TerminateProcess> left behind (C<1>, in
 practice). Test for C<exit != 0> rather than for C<137>.
-=item A kill takes the B<whole process tree>: C<taskkill /T /F /PID> is issued
+=item A kill targets the B<whole process tree>: C<taskkill /T /F /PID> is issued
 against the child before the C<TerminateProcess> backstop, so grandchildren the
-command spawned do not outlive the kill. It is fire-and-forget — the watcher
-collects the exit status independently — and if C<taskkill> is missing from a
-stripped image the direct-child kill still runs. (Unix reaches the tree a
+command spawned are included. The worker waits for bounded C<taskkill>
+completion before attempting a direct-child fallback. The kill tool returns
+immediately; toolkit shutdown also waits for this cleanup. If C<taskkill> is
+missing from a stripped image, the direct-child kill still runs and shutdown
+reports the tree-cleanup failure. (Unix reaches the tree a
 different way, by signalling the process group of an isolated child; see
 L<#Terminal isolation>.)
 =item C<isolate-terminal> detaches standard input here as it does everywhere,

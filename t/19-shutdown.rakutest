@@ -1,0 +1,531 @@
+use v6.d;
+use Test;
+use NativeCall;
+use JSON::Fast;
+use MCP::Server;
+use MCP::Server::Tool::Shell;
+use MCP::Server::Tool::Shell::Jobs;
+use MCP::Server::Tool::Shell::Buffer;
+use MCP::Server::Tool::Shell::Test::Kit;
+use MCP::Server::Tool::Shell::Isolation;
+
+my constant IS-WIN = $*DISTRO.is-win;
+my sub posix-kill(int32, int32 --> int32) is native(Str) is symbol('kill') { * }
+my sub win-open-process(uint32, int32, uint32 --> Pointer)
+	is native('kernel32') is symbol('OpenProcess') { * }
+my sub win-wait(Pointer, uint32 --> uint32)
+	is native('kernel32') is symbol('WaitForSingleObject') { * }
+my sub win-terminate(Pointer, uint32 --> int32)
+	is native('kernel32') is symbol('TerminateProcess') { * }
+my sub win-close(Pointer --> int32)
+	is native('kernel32') is symbol('CloseHandle') { * }
+
+# A Windows handle pins process identity even after it exits. Linux zombies
+# are terminated, despite retaining their pid until their new parent reaps.
+class OwnedProcess {
+	has Int:D $.pid is required;
+	has Pointer $!handle;
+	submethod TWEAK {
+		if IS-WIN {
+			$!handle = win-open-process(0x100001, 0, $!pid);
+			die "Cannot open owned fixture process $!pid" unless $!handle;
+		}
+	}
+	method running(--> Bool:D) {
+		return win-wait($!handle, 0) == 0x102 if IS-WIN;
+		my $stat = "/proc/$!pid/stat".IO;
+		if $stat.e {
+			my $raw = try $stat.open.slurp(:close);
+			return False if $raw.defined && $raw ~~ /\) \s+ <[ZX]> \s/;
+		}
+		posix-kill($!pid, 0) == 0;
+	}
+	method terminate(--> Nil) {
+		return unless self.running;
+		IS-WIN ?? win-terminate($!handle, 9) !! posix-kill($!pid, Signal::SIGKILL.value);
+	}
+	method close(--> Nil) {
+		win-close($!handle) if IS-WIN && $!handle;
+		$!handle = Pointer;
+	}
+}
+
+my constant WORKER = q:to/WORKER/;
+my ($directory, $nonce, $role, $raku) = @*ARGS;
+if $role eq 'job' {
+	my $child = Proc::Async.new($raku, $*PROGRAM.absolute, $directory, $nonce, 'grandchild', $raku);
+	$child.stdout.tap(-> $ {}, quit => -> $ {});
+	$child.stderr.tap(-> $ {}, quit => -> $ {});
+	my $done = $child.start;
+}
+$directory.IO.add("$role.pid").spurt("$nonce|$*PID");
+await Promise.in(120);
+WORKER
+
+my constant CONTROLLER = q:to/CONTROLLER/;
+use JSON::Fast;
+use MCP::Server;
+use MCP::Server::Tool::Shell;
+my ($directory, $nonce, $raku, $mode) = @*ARGS;
+$mode //= 'normal';
+class CountedShell is MCP::Server::Tool::Shell {
+	has Str $.label;
+	has IO::Path $.log;
+	method shutdown(--> Nil) {
+		$!log.spurt("$!label\n", :append);
+		callsame;
+	}
+}
+class StalledJob is MCP::Server::Tool::Shell::Jobs::Job {
+	method kill(Bool:D :$timed-out = False --> Bool:D) { True }
+	method finished(--> Bool:D) { True }
+}
+my $kit;
+if $mode eq 'live' || $mode eq 'failure' {
+	my $first = CountedShell.new(allow => [$raku], label => 'first', log => $directory.IO.add('calls.log'));
+	if $mode eq 'live' { $first.shutdown }
+	else {
+		my $table = MCP::Server::Tool::Shell.^attributes.first(*.name eq '$!jobs').get_value($first);
+		for ^6 {
+			$table.admit(-> $id {
+				StalledJob.new(:$id, command => 'never-spawned',
+					stdout => MCP::Server::Tool::Shell::Buffer.new,
+					stderr => MCP::Server::Tool::Shell::Buffer.new);
+			});
+		}
+	}
+	$kit = CountedShell.new(allow => [$raku], label => 'live', log => $directory.IO.add('calls.log'));
+}
+else { $kit = MCP::Server::Tool::Shell.new(allow => [$raku]) }
+my $server = MCP::Server.new(:name<shutdown-controller>);
+$server.plug: $kit;
+my %response = $server.handle-request({
+	jsonrpc => '2.0', id => 1, method => 'tools/call',
+	params => { name => 'sh_start', arguments => {
+		command => $raku,
+		args => [$directory.IO.add('worker.raku').Str, $directory, $nonce, 'job', $raku],
+	} },
+});
+die %response.raku if %response<result><isError>;
+my %started = from-json(%response<result><content>[0]<text>);
+$directory.IO.add('controller.ready').spurt(%started<job>);
+die 'Controller release missing' unless $*IN.get eq 'exit';
+exit 0;
+CONTROLLER
+
+sub fixture(Str:D $tag --> Hash:D) {
+	my $nonce = "$*PID-{(2 ** 40).rand.Int}";
+	my $root = $*TMPDIR.add("mcp-shell-shutdown-$tag-$nonce");
+	$root.mkdir;
+	$root.add('worker.raku').spurt(WORKER);
+	$root.add('controller.raku').spurt(CONTROLLER);
+	%( :$root, :$nonce );
+}
+
+sub fixture-pid(%f, Str:D $role --> Int) {
+	my $raw = try %f<root>.add("$role.pid").open.slurp(:close);
+	return Int unless $raw.defined;
+	my ($nonce, $pid) = $raw.split('|');
+	$nonce eq %f<nonce> && $pid.defined && $pid ~~ /^ \d+ $/
+		&& $pid.Int > 0 && $pid.Int != $*PID
+		?? $pid.Int !! Int;
+}
+
+sub child-includes(--> List:D) {
+	# Forward real repository provenance, including installed dependencies,
+	# rather than assuming a sibling checkout exists in an ecosystem install.
+	my @specs = $*REPO.repo-chain.grep(* ~~ CompUnit::Repository::Locally).map(*.path-spec);
+	("-I{$*PROGRAM.parent.parent.add('lib').absolute}", |@specs.map({ "-I$_" })).List;
+}
+
+sub clean-fixture(%f, @owned, $controller, $done --> Nil) {
+	try $controller.kill(Signal::SIGKILL)
+		if $controller.defined && $done.defined && $done.status ~~ Planned;
+	for @owned -> $owned {
+		next if $owned.pid == $*PID;
+		next if $controller.defined && process-pid($controller).defined
+			&& $owned.pid == process-pid($controller);
+		try $owned.terminate;
+	}
+	for <job grandchild> -> $role {
+		my $pid = fixture-pid(%f, $role);
+		next unless $pid.defined;
+		next if $controller.defined && process-pid($controller).defined
+			&& $pid == process-pid($controller);
+		next if @owned.first({ .pid == $pid }).defined;
+		my $owned = try OwnedProcess.new(:$pid);
+		if $owned.defined { try $owned.terminate; try $owned.close }
+	}
+	await Promise.anyof($done, Promise.in(5)) if $done.defined;
+	my $ = try $done.result if $done.defined && $done.status !~~ Planned;
+	for @owned -> $owned { try $owned.close }
+	for <job.pid grandchild.pid controller.ready worker.raku controller.raku calls.log> -> $name {
+		my $path = %f<root>.add($name);
+		try $path.unlink if $path.e;
+	}
+	try %f<root>.rmdir;
+}
+
+subtest 'normal parent exit terminates its real job and grandchild' => {
+	plan 8;
+	my %f = fixture('normal-exit');
+	my @owned;
+	my ($controller, $done);
+	LEAVE clean-fixture(%f, @owned, $controller, $done);
+	$controller = Proc::Async.new(:w, raku-path(), |child-includes(),
+		%f<root>.add('controller.raku').Str, %f<root>.Str, %f<nonce>, raku-path());
+	my $stderr = '';
+	$controller.stdout.tap(-> $ {}, quit => -> $ {});
+	$controller.stderr.tap(-> $chunk { $stderr ~= $chunk if $stderr.chars < 2000 }, quit => -> $ {});
+	$done = $controller.start;
+	my $ready = wait-until({ %f<root>.add('controller.ready').e
+		&& fixture-pid(%f, 'job').defined && fixture-pid(%f, 'grandchild').defined });
+	ok $ready, 'both owned processes completed the readiness handshake';
+	bail-out "Fixture did not become ready: $stderr" unless $ready;
+	@owned = <job grandchild>.map({ OwnedProcess.new(pid => fixture-pid(%f, $_)) });
+	ok @owned[0].running, 'the admitted job is really running before parent exit';
+	ok @owned[1].running, 'its grandchild is really running before parent exit';
+	await $controller.print("exit\n");
+	$controller.close-stdin;
+	await Promise.anyof($done, Promise.in(15));
+	ok $done.status !~~ Planned, 'the controller exits within the shutdown bound';
+	bail-out "Controller did not exit: $stderr" if $done.status ~~ Planned;
+	my $result = $done.result;
+	is $result.exitcode, 0, 'the controller exits normally, rather than being killed';
+	ok wait-until({ !@owned[0].running && !@owned[1].running }, timeout => 5),
+		'clean parent exit terminates the whole job tree';
+	nok @owned[0].running, 'the job is no longer executing';
+	nok @owned[1].running, 'the grandchild is no longer executing';
+};
+
+sub registry($kit) {
+	MCP::Server::Tool::Shell.^attributes.first(*.name eq '$!jobs').get_value($kit);
+}
+
+sub local-kit(*%config --> Hash:D) {
+	my $kit = MCP::Server::Tool::Shell.new(allow => [raku-path()], |%config);
+	my $server = MCP::Server.new(:name<shutdown-local>);
+	$server.plug: $kit;
+	%( :$kit, :$server );
+}
+
+sub start-tree(%f, $server --> Str:D) {
+	my %response = call($server, 'sh_start', {
+		command => raku-path(), args => [%f<root>.add('worker.raku').Str,
+			%f<root>.Str, %f<nonce>, 'job', raku-path()],
+	});
+	die "Tree fixture failed: {text(%response)}" if errored(%response);
+	from-json(text(%response))<job>;
+}
+
+sub owned-tree(%f --> Array:D) {
+	die 'Tree fixture did not report its owned pids' unless wait-until({
+		fixture-pid(%f, 'job').defined && fixture-pid(%f, 'grandchild').defined;
+	});
+	<job grandchild>.map({ OwnedProcess.new(pid => fixture-pid(%f, $_)) }).Array;
+}
+
+subtest 'explicit concurrent shutdown closes admission and retains killed records' => {
+	plan 11;
+	my %f = fixture('explicit');
+	my %local = local-kit();
+	my @owned;
+	LEAVE clean-fixture(%f, @owned, Any, Any);
+	my $id = start-tree(%f, %local<server>);
+	@owned = owned-tree(%f).list;
+	ok @owned.all.running, 'the actual job tree is alive before shutdown';
+	my $first = start { %local<kit>.shutdown };
+	my $second = start { %local<kit>.shutdown };
+	my $all = Promise.allof($first, $second);
+	await Promise.anyof($all, Promise.in(10));
+	ok $first.status ~~ Kept && $second.status ~~ Kept, 'concurrent callers share successful cleanup';
+	is from-json(text(call(%local<server>, 'sh_poll', { job => $id })))<state>, 'killed',
+		'the retained record polls as killed';
+	ok wait-until({ !@owned[0].running && !@owned[1].running }, timeout => 5),
+		'both owned processes are terminated';
+	my %output = from-json(text(call(%local<server>, 'sh_output', { job => $id })));
+	is %output<state>, 'killed', 'output remains available after shutdown';
+	ok %output<eof>, 'the retained output is terminal';
+	lives-ok { %local<kit>.shutdown }, 'a repeated shutdown is harmless';
+	my $before = registry(%local<kit>).elems;
+	my $marker = %f<root>.add('forbidden.marker');
+	my %refused = call(%local<server>, 'sh_start', {
+		command => raku-path(), args => ['-e', 'spurt @*ARGS[0], "spawned"', $marker.Str],
+	});
+	ok errored(%refused), 'new background work is refused after closure';
+	like text(%refused), /'shut down'/, 'closure has a distinct error';
+	is registry(%local<kit>).elems, $before, 'refusal allocates no job record';
+	nok $marker.e, 'the refused command never ran';
+};
+
+subtest 'cancellation before spawn skips the launcher and process' => {
+	plan 8;
+	my %f = fixture('before-spawn');
+	LEAVE clean-fixture(%f, [], Any, Any);
+	my $calls = 0;
+	my $table = MCP::Server::Tool::Shell::Jobs::Registry.new;
+	my $job = $table.admit(-> $id {
+		MCP::Server::Tool::Shell::Jobs::Job.new(:$id, command => raku-path(),
+			args => ['-e', 'spurt @*ARGS[0], "spawned"', %f<root>.add('forbidden.marker').Str],
+			stdout => MCP::Server::Tool::Shell::Buffer.new,
+			stderr => MCP::Server::Tool::Shell::Buffer.new,
+			launcher => -> %plan { $calls++; %plan });
+	});
+	my $snapshot = $table.close;
+	is $snapshot.elems, 1, 'closing admission snapshots the admitted object';
+	ok $snapshot[0] === $job, 'the snapshot retains exact object identity';
+	ok $job.kill, 'pre-spawn cancellation is accepted';
+	is $job.status<state>, 'killed', 'the pending job becomes terminal';
+	nok $job.status<exit>.defined, 'a never-started command has no invented exit status';
+	lives-ok { $job.spawn }, 'a later spawn observes cancellation';
+	is $calls, 0, 'the cancelled job never invokes its launcher';
+	nok %f<root>.add('forbidden.marker').e, 'the cancelled job never creates a process';
+};
+
+subtest 'shutdown cancels an admitted job while its launcher is paused' => {
+	plan 7;
+	my %f = fixture('paused-launcher');
+	LEAVE clean-fixture(%f, [], Any, Any);
+	my $entered = Promise.new;
+	my $release = Promise.new;
+	my %local = local-kit(launcher => -> %plan {
+		$entered.keep(True);
+		await $release;
+		%plan;
+	});
+	my $marker = %f<root>.add('forbidden.marker');
+	my $starting = start { call(%local<server>, 'sh_start', {
+		command => raku-path(), args => ['-e', 'spurt @*ARGS[0], "spawned"', $marker.Str],
+	}) };
+	LEAVE { $release.keep(True) if $release.status ~~ Planned }
+	await Promise.anyof($entered, Promise.in(30));
+	ok $entered.status ~~ Kept, 'the launcher handshake proves admission happened';
+	my $stopping = start { %local<kit>.shutdown };
+	await Promise.anyof($stopping, Promise.in(5));
+	ok $stopping.status ~~ Kept, 'shutdown does not wait for user launcher code';
+	is registry(%local<kit>).close[0].status<state>, 'killed', 'the paused job is terminal';
+	$release.keep(True);
+	await Promise.anyof($starting, Promise.in(5));
+	ok $starting.status ~~ Kept, 'the original start call returns after release';
+	my %response = $starting.result;
+	nok errored(%response), 'the accepted call retains its handle';
+	nok $marker.e, 'returning from the launcher cannot spawn after shutdown';
+	is registry(%local<kit>).elems, 1, 'the cancelled handle remains pollable';
+};
+
+subtest 'shutdown from started or terminal notifications cannot wait on itself' => {
+	plan 8;
+	for <started exited> -> $state {
+		my $kit = MCP::Server::Tool::Shell.new(allow => [raku-path()]);
+		my $observed = Promise.new;
+		my $server = MCP::Server.new(:name<shutdown-callback>, on-notify => -> %event {
+			if (%event<method> // '') eq 'notifications/job'
+				&& (%event<params><state> // '') eq $state {
+				$kit.shutdown;
+				$observed.keep(True);
+			}
+		});
+		$server.plug: $kit;
+		my $calling = start { call($server, 'sh_start', {
+			command => raku-path(), args => ['-e', $state eq 'started' ?? 'sleep 60' !! 'exit 0'],
+		}) };
+		await Promise.anyof($observed, Promise.in(10));
+		ok $observed.status ~~ Kept, "$state notification can synchronously shut down";
+		await Promise.anyof($calling, Promise.in(5));
+		ok $calling.status ~~ Kept, "$state callback lets its start call complete";
+		my %response = $calling.result;
+		nok errored(%response), "$state callback preserves the accepted handle";
+		my $id = from-json(text(%response))<job>;
+		is from-json(text(call($server, 'sh_poll', { job => $id })))<state>,
+			$state eq 'started' ?? 'killed' !! 'exited', "$state publishes terminal state before callbacks";
+	}
+};
+
+subtest 'manual kill and timeout racing share one retained kill operation' => {
+	plan 6;
+	my %local = local-kit();
+	my %response = call(%local<server>, 'sh_start', {
+		command => raku-path(), args => ['-e', '$*OUT.out-buffer = 0; print "ready"; sleep 60'],
+	});
+	my $job = registry(%local<kit>).get(from-json(text(%response))<job>);
+	ok wait-until({ $job.stdout.stats<bytes> > 0 }), 'the real command is ready before either kill';
+	my $manual = start { $job.kill };
+	my $timeout = start { $job.kill(:timed-out) };
+	await Promise.allof($manual, $timeout);
+	my $work = $job.kill-work;
+	ok $work.defined, 'the first killer publishes its work promise';
+	lives-ok { %local<kit>.shutdown }, 'shutdown also waits for the already requested kill';
+	ok $job.kill-work === $work, 'later killers retain the exact same operation';
+	is $job.status<state>, 'killed', 'the command reaches killed state';
+	ok $job.cleanup.status ~~ Kept, 'both state and kill cleanup have settled';
+};
+
+subtest 'one toolkit shutdown leaves another toolkit tree alone' => {
+	plan 6;
+	my %first = fixture('first-kit');
+	my %second = fixture('second-kit');
+	my @first-owned;
+	my @second-owned;
+	LEAVE clean-fixture(%first, @first-owned, Any, Any);
+	LEAVE clean-fixture(%second, @second-owned, Any, Any);
+	my %a = local-kit();
+	my %b = local-kit();
+	start-tree(%first, %a<server>);
+	start-tree(%second, %b<server>);
+	@first-owned = owned-tree(%first).list;
+	@second-owned = owned-tree(%second).list;
+	%a<kit>.shutdown;
+	ok !@first-owned[0].running && !@first-owned[1].running, 'the selected toolkit tree is stopped';
+	ok @second-owned[0].running, 'the other toolkit job is still running';
+	ok @second-owned[1].running, 'the other toolkit grandchild is still running';
+	lives-ok { %a<kit>.shutdown }, 'repeating one shutdown still leaves the other tree alone';
+	ok @second-owned[0].running && @second-owned[1].running, 'the other tree survives idempotency';
+	%b<kit>.shutdown;
+	ok wait-until({ !@second-owned[0].running && !@second-owned[1].running }),
+		'the other owner can shut down its own tree';
+};
+
+my class PendingCleanupJob is MCP::Server::Tool::Shell::Jobs::Job {
+	has Promise $.pending = Promise.new;
+	method finished(--> Bool:D) { True }
+	method finished-at(--> Instant:D) { now - 60 }
+	method cleanup(--> Promise:D) { $!pending }
+}
+
+subtest 'reaping retains pending cleanup and resumes without a client touch' => {
+	plan 5;
+	my $table = MCP::Server::Tool::Shell::Jobs::Registry.new(ttl => 0.01, max-finished => 1);
+	my $job = $table.admit(-> $id {
+		PendingCleanupJob.new(:$id, command => 'never-spawned',
+			stdout => MCP::Server::Tool::Shell::Buffer.new,
+			stderr => MCP::Server::Tool::Shell::Buffer.new);
+	});
+	$table.reap;
+	is $table.elems, 1, 'TTL does not forget a record with pending cleanup';
+	ok $table.get($job.id) === $job, 'the retained record has exact identity';
+	my $snapshot = $table.close;
+	is $snapshot.elems, 1, 'shutdown snapshots pending cleanup despite terminal state';
+	ok $snapshot[0] === $job, 'shutdown keeps the exact pending-cleanup object';
+	$job.pending.keep(True);
+	ok wait-until({ $table.elems == 0 }), 'cleanup completion triggers reaping without get or poll';
+};
+
+subtest 'failed exec followed by shutdown is harmless' => {
+	plan 4;
+	my $missing = "mcp-shell-absent-$*PID-{(2 ** 40).rand.Int}";
+	my $kit = MCP::Server::Tool::Shell.new(allow => [$missing]);
+	my $server = MCP::Server.new(:name<shutdown-failed-exec>);
+	$server.plug: $kit;
+	my %response = call($server, 'sh_start', { command => $missing });
+	my $id = from-json(text(%response))<job>;
+	ok wait-until({ registry($kit).get($id).finished }), 'the failed execution reaches terminal state';
+	is registry($kit).get($id).status<exit>, -1, 'it keeps the failed-spawn status';
+	lives-ok { $kit.shutdown }, 'shutdown consumes the broken ready/exit condition harmlessly';
+	lives-ok { $kit.shutdown }, 'a repeated shutdown is harmless too';
+};
+
+subtest 'pre-spawn cancellation notification can reenter shutdown' => {
+	plan 4;
+	my $entered = Promise.new;
+	my $release = Promise.new;
+	my $observed = Promise.new;
+	my $kit = MCP::Server::Tool::Shell.new(allow => [raku-path()], launcher => -> %plan {
+		$entered.keep(True);
+		await $release;
+		%plan;
+	});
+	my $server = MCP::Server.new(:name<shutdown-cancel-callback>, on-notify => -> %event {
+		if (%event<method> // '') eq 'notifications/job' && (%event<params><state> // '') eq 'killed' {
+			$kit.shutdown;
+			$observed.keep(True);
+		}
+	});
+	$server.plug: $kit;
+	my $starting = start { call($server, 'sh_start', {
+		command => raku-path(), args => ['-e', 'sleep 60'],
+	}) };
+	LEAVE { $release.keep(True) if $release.status ~~ Planned }
+	await Promise.anyof($entered, Promise.in(30));
+	ok $entered.status ~~ Kept, 'the launcher is paused before a process exists';
+	my $stopping = start { $kit.shutdown };
+	await Promise.anyof($stopping, Promise.in(5));
+	ok $stopping.status ~~ Kept, 'the cleanup owner completes without its callback stack';
+	await Promise.anyof($observed, Promise.in(5));
+	ok $observed.status ~~ Kept, 'the cancellation callback completes its reentrant shutdown';
+	$release.keep(True);
+	await Promise.anyof($starting, Promise.in(5));
+	ok $starting.status ~~ Kept, 'the cancelled start eventually returns its handle';
+};
+
+my class ReadinessProbe {
+	has Promise $.ready .= new;
+	has Promise $.entered .= new;
+	has Promise $.killed .= new;
+	method pid(--> Promise:D) {
+		$!entered.keep(True) if $!entered.status ~~ Planned;
+		$!ready;
+	}
+	method kill($signal --> Nil) { $!killed.keep(True) if $!killed.status ~~ Planned }
+}
+
+subtest 'nonblocking tree kill waits for readiness or failed spawn' => {
+	plan 6;
+	for False, True -> $broken {
+		my $probe = ReadinessProbe.new;
+		my $*DISTRO = class { method is-win { False } }.new;
+		kill-process-tree($probe);
+		await Promise.anyof($probe.entered, Promise.in(5));
+		ok $probe.entered.status ~~ Kept, 'the asynchronous worker reached the readiness boundary';
+		ok $probe.killed.status ~~ Planned, 'no signal is attempted before readiness settles';
+		$broken ?? $probe.ready.break('synthetic failed spawn') !! $probe.ready.keep(Int);
+		await Promise.anyof($probe.killed, Promise.in(5));
+		ok $probe.killed.status ~~ Kept, 'the direct fallback completes after readiness settlement';
+	}
+};
+
+for <live failure> -> $mode {
+	subtest "$mode END cleanup isolates toolkits and removes explicitly closed instances" => {
+		plan $mode eq 'live' ?? 7 !! 8;
+		my %f = fixture("end-$mode");
+		my @owned;
+		my ($controller, $done);
+		LEAVE clean-fixture(%f, @owned, $controller, $done);
+		$controller = Proc::Async.new(:w, raku-path(), |child-includes(),
+			%f<root>.add('controller.raku').Str, %f<root>.Str, %f<nonce>, raku-path(), $mode);
+		my $stderr = '';
+		$controller.stdout.tap(-> $ {}, quit => -> $ {});
+		$controller.stderr.tap(-> $chunk { $stderr ~= $chunk if $stderr.chars < 2000 }, quit => -> $ {});
+		$done = $controller.start;
+		my $ready = wait-until({ %f<root>.add('controller.ready').e
+			&& fixture-pid(%f, 'job').defined && fixture-pid(%f, 'grandchild').defined });
+		ok $ready, 'the live toolkit has a real ready job tree';
+		bail-out "END fixture failed: $stderr" unless $ready;
+		@owned = owned-tree(%f).list;
+		my $log = %f<root>.add('calls.log');
+		my @before = $log.e ?? $log.open.slurp(:close).lines !! ();
+		is-deeply @before.List, $mode eq 'live' ?? ('first',) !! ().List,
+			'only the explicit shutdown ran before parent exit';
+		my $start = now;
+		await $controller.print("exit\n");
+		$controller.close-stdin;
+		await Promise.anyof($done, Promise.in(15));
+		bail-out "END fixture did not exit: $stderr" if $done.status ~~ Planned;
+		my $result = $done.result;
+		is $result.exitcode, 0, 'the controller exits normally';
+		is-deeply $log.open.slurp(:close).lines.List, <first live>.List,
+			'END skips the removed instance and still cleans the live toolkit';
+		ok wait-until({ !@owned[0].running && !@owned[1].running }, timeout => 5),
+			'END terminates the live toolkit tree';
+		if $mode eq 'failure' {
+			like $stderr, /'Shell shutdown failed:' .* 'within 5 seconds'/,
+				'END reports the failed toolkit without abandoning the next one';
+			ok now - $start < 10, 'six unsettled jobs share one shutdown deadline';
+		}
+		else {
+			is $stderr, '', 'successful cleanup has no failure diagnostic';
+		}
+		nok @owned[1].running, 'the live toolkit grandchild is no longer executing';
+	};
+}
+
+done-testing;

@@ -159,6 +159,25 @@ has Str:D $!run-logger = 'run';
 has Str:D $!job-logger = 'start';
 
 has $!jobs;
+has Lock $!shutdown-lock .= new;
+has Promise $!shutdown;
+
+my Lock $live-lock .= new;
+my @live;
+my Bool $ending = False;
+
+END {
+	my $kits = $live-lock.protect: {
+		$ending = True;
+		@live.Array;
+	};
+	for $kits.list -> $kit {
+		{
+			CATCH { default { try note "Shell shutdown failed: {.message}" } }
+			$kit.shutdown;
+		}
+	}
+}
 
 # How children are kept away from the host's terminal, resolved once per
 # process (see MCP::Server::Tool::Shell::Isolation) and consulted at both spawn
@@ -209,6 +228,49 @@ submethod TWEAK {
 		max-jobs => $!max-jobs,
 		max-finished => $!max-finished-jobs,
 	);
+	$live-lock.protect: {
+		die 'Cannot construct a Shell toolkit during process shutdown' if $ending;
+		@live.push(self);
+	}
+}
+
+#| Close background admission and terminate this toolkit's jobs within one bound.
+#| Foreground requests retain their existing cancellation and timeout behavior.
+method shutdown(--> Nil) {
+	my $owner = False;
+	my $completion = $!shutdown-lock.protect: {
+		unless $!shutdown.defined {
+			$!shutdown = Promise.new;
+			$owner = True;
+		}
+		$!shutdown;
+	};
+	if $owner {
+		my $failure;
+		{
+			CATCH { default { $failure = $_ } }
+			my $deadline = now + KILL-GRACE;
+			my $jobs = $!jobs.close;
+			for $jobs.list -> $job { $job.kill }
+			my @pending;
+			for $jobs.list -> $job {
+				@pending.push($job.settlement);
+				@pending.push($job.kill-work) if $job.kill-work.defined;
+			}
+			my $all = Promise.allof(|@pending);
+			await Promise.anyof($all, Promise.in(max(0, ($deadline - now).Num)));
+			die 'Shell shutdown could not settle every background job within 5 seconds'
+				if $all.status ~~ Planned;
+			for @pending -> $pending {
+				my $result = $pending.result;
+				die "Shell shutdown tree cleanup failed: {$result<error>}"
+					if $result ~~ Associative:D && !$result<ok>;
+			}
+			$live-lock.protect: { @live = @live.grep(-> $kit { !($kit === self) }) };
+		}
+		$failure.defined ?? $completion.break($failure) !! $completion.keep(True);
+	}
+	await $completion;
 }
 
 method default-prefix(--> Str) { 'sh' }
@@ -986,7 +1048,7 @@ method !execute(%plan, Real:D $timeout --> Str:D) {
 		# was given a session (and so a process group) of its own.
 		# Grandchildren the command spawned would otherwise outlive the timeout
 		# and hold its pipes open.
-		kill-process-tree($proc, group => $!isolation.new-session);
+		kill-process-tree($proc, :$done, group => $!isolation.new-session);
 		await Promise.anyof($done, Promise.in(KILL-GRACE));
 	}
 
