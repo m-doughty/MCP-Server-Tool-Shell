@@ -2,6 +2,17 @@ Revision history for MCP::Server::Tool::Shell
 
 {{$NEXT}}
 
+0.4.5  2026-10-31T23:45:34Z
+    - [2026-10-31] Add idempotent toolkit shutdown for background jobs.
+      Close job admission atomically, cancel pending starts, and wait for
+      owned job trees within one shared deadline. Clean process exit
+      attempts the same cleanup for remaining toolkits; abrupt termination
+      can still leave jobs running. Foreground cancellation is unchanged.
+      Preserve terminal records while tree cleanup remains pending.
+    - [2026-10-31] Wait for Windows tree-kill completion before the direct
+      child fallback, retaining nonblocking kill calls and their cleanup
+      completion for shutdown. Handle process-readiness and startup races.
+
 0.4.4  2026-10-31T16:50:17Z
     - [2026-10-31] Publish string item schemas for the "args" arrays of
       "run" and "start". Requires MCP::Server 0.7.2 or later.
